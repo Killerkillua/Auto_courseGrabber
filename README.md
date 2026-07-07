@@ -8,7 +8,7 @@
 
 > 正在搜索“正方教务系统自动选课”“正方教务系统抢课脚本”“新正方教务管理系统定时选课”？请先阅读下方的适用范围，再按三步快速启动。
 
-有关学校覆盖与证据等级，请参阅[正方高校覆盖与兼容性记录](docs/zhengfang-university-coverage.md)；页面加载、课程展开与换课限制请参阅[使用注意](docs/usage-notes.md)；远程仓库的 Description 和 Topics 请按[GitHub 元数据清单](docs/github-metadata.md)手动设置。
+有关学校覆盖与证据等级，请参阅[正方高校覆盖与兼容性记录](docs/zhengfang-university-coverage.md)；页面加载、课程展开与换课限制请参阅[使用注意](docs/usage-notes.md)
 
 ## ⚡ 快速开始
 
