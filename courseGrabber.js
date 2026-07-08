@@ -16,18 +16,31 @@
   const __CG_LOADED_KEY__ = "__AUTO_COURSE_GRABBER_LOADED__";
   const __CG_INSTANCE_KEY__ = "__AUTO_COURSE_GRABBER_INSTANCE_ID__";
   const __CG_REFRESH_LOCK_KEY__ = "__AUTO_COURSE_GRABBER_LAST_REFRESH_AT__";
+  const __CG_CLEANUP_KEY__ = "__AUTO_COURSE_GRABBER_CLEANUP__";
+
+  function cleanupPreviousInstance(reason = "unknown") {
+    const previousCleanup = __CG_GLOBAL__[__CG_CLEANUP_KEY__];
+    if (typeof previousCleanup === "function") {
+      try {
+        previousCleanup(reason);
+      } catch (e) {
+        // 忽略清理失败，继续覆盖新实例
+      }
+    }
+
+    if (__CG_GLOBAL__.grab && typeof __CG_GLOBAL__.grab.stop === "function") {
+      try {
+        __CG_GLOBAL__.grab.stop();
+      } catch (e) {
+        // 忽略停止失败
+      }
+    }
+  }
 
   if (__CG_GLOBAL__[__CG_LOADED_KEY__]) {
-    try {
-      // 尝试停止旧实例（如果旧实例仍挂在 window.grab 上）
-      if (__CG_GLOBAL__.grab && typeof __CG_GLOBAL__.grab.stop === "function") {
-        __CG_GLOBAL__.grab.stop();
-      }
-    } catch (e) {
-      // 忽略停止失败
-    }
+    cleanupPreviousInstance("reload");
     console.warn(
-      "[抢课脚本] 检测到脚本已加载过一次：已尝试停止旧实例，并将覆盖为新实例。",
+      "[抢课脚本] 检测到脚本已加载过一次：已尝试彻底清理旧实例，并将覆盖为新实例。",
     );
   }
 
@@ -218,9 +231,25 @@
     return match ? match[1].trim() : jxbmc.trim();
   }
 
+  function getGrabberDoc(root = document) {
+    const mainFrame = root.querySelector?.('#mainFrame');
+    const kbFrame = root.querySelector?.('#kbFrame');
+    return mainFrame?.contentDocument || kbFrame?.contentDocument || root;
+  }
+
+  function getCourseDocument() {
+    return getGrabberDoc(document);
+  }
+
   function isCourseHeadMatching(head, courseCodeOrName) {
     const input = String(courseCodeOrName).trim();
     const isCode = isCourseCode(input);
+
+    if (head?.matches?.('tr')) {
+      const firstCell = head.cells?.[0]?.textContent?.trim() || "";
+      const nameCell = head.cells?.[1]?.textContent?.trim() || "";
+      return isCode ? firstCell === input : nameCell.toLowerCase().includes(input.toLowerCase());
+    }
 
     if (isCode) {
       const codeInput = head.querySelector('input[name="kch_id"]');
@@ -241,10 +270,17 @@
     return courseName.toLowerCase().includes(input.toLowerCase());
   }
 
-  function findMatchingCourseHeads(courseCodeOrName) {
+  function findMatchingCourseHeads(courseCodeOrName, root = getCourseDocument()) {
     const matchedHeads = [];
-    const heads = document.querySelectorAll(".panel-heading.kc_head");
 
+    const rows = root.querySelectorAll?.('tr') || [];
+    for (let row of rows) {
+      if (isCourseHeadMatching(row, courseCodeOrName)) {
+        matchedHeads.push(row);
+      }
+    }
+
+    const heads = root.querySelectorAll?.('.panel-heading.kc_head') || [];
     for (let head of heads) {
       if (isCourseHeadMatching(head, courseCodeOrName)) {
         matchedHeads.push(head);
@@ -264,6 +300,10 @@
   }
 
   function getTeachingRowsInCourseSection(head) {
+    if (head?.matches?.('tr')) {
+      return [head];
+    }
+
     const rows = [];
     const seen = new Set();
     const addRows = (rowList) => {
@@ -297,25 +337,11 @@
   function expandCourseByCode(courseCodeOrName) {
     const heads = findMatchingCourseHeads(courseCodeOrName);
     for (let head of heads) {
-      /*
-                                <div class="panel-heading kc_head" onclick="loadJxbxxZzxk(this)"
-                                    style="background-color:#C1FFC1;">
-                                    <h3 class="panel-title"><span class="kcmc" id="kcmc_23005523">(23005523)<a
-                                                href="javascript:void(0);"
-                                                onclick="showCourseInfo('23005523')">质量管理</a><i class="l-kc-xf"
-                                                style="display: inline;"> - <i id="xf_23005523">5.0</i>
-                                                学分</i></span><span>教学班个数：<font class="jxbgsxx">4</font></span><span
-                                            id="zt_txt_23005523">状态：<b>已选</b></span></h3><input type="hidden"
-                                        name="kch_id" value="23005523"><input type="hidden" name="kcxzzt"
-                                        id="kcxzzt_23005523" value="1"><input type="hidden" name="cxbj"
-                                        id="cxbj_23005523" value="0"><input type="hidden" name="fxbj" id="fxbj_23005523"
-                                        value="0"><input type="hidden" name="xxkbj" id="xxkbj_23005523" value="0"><input
-                                        type="hidden" name="czzt" value="0"><a href="javascript:void(0);"
-                                        class="expand_close expand1">展开关闭</a>
-                                </div>
-            */
-      // 直接触发 click（等价于用户点击）
-      head.click();
+      if (head?.matches?.('tr')) {
+        return true;
+      }
+
+      activateElement(head);
       return true;
     }
     return false;
@@ -490,18 +516,25 @@
     const isCode = isCourseCode(input);
 
     if (isCode) {
-      // 按课程号匹配：检查 td.kch_id
+      const firstCellText = row.cells?.[0]?.textContent?.trim() || '';
+      if (firstCellText === input) {
+        return true;
+      }
+
       const kchIdCell = row.querySelector("td.kch_id");
       if (kchIdCell && kchIdCell.textContent.trim() === input) {
         return true;
       }
     } else {
-      // 按课程名称匹配：检查 td.jxbmc 中的教学班名称
+      const nameCellText = row.cells?.[1]?.textContent?.trim() || '';
+      if (nameCellText && nameCellText.toLowerCase().includes(input.toLowerCase())) {
+        return true;
+      }
+
       const jxbmcCell = row.querySelector("td.jxbmc");
       if (jxbmcCell) {
         const jxbmcText = jxbmcCell.textContent.trim();
         const courseName = extractCourseNameFromJxbmc(jxbmcText);
-        // 精确匹配或包含匹配
         if (
           courseName === input ||
           courseName.includes(input) ||
@@ -520,6 +553,7 @@
     const teachingClasses = [];
     const input = String(targetCourseCodeOrName).trim();
     const seenRows = new Set();
+    const courseDoc = getCourseDocument();
 
     const pushTeachingClass = (row) => {
       if (!row || seenRows.has(row)) {
@@ -527,34 +561,45 @@
       }
 
       seenRows.add(row);
-      const selectButton = row.querySelector('button, a, input[type="button"]');
+      const selectButton =
+        row.querySelector('a[href*="xsxkFun"], button, a, input[type="button"]');
       if (!selectButton) {
         return;
       }
 
       const classInfo = extractTeachingClassInfo(row);
       if (classInfo && classInfo.id) {
+        const rowCells = row.cells ? Array.from(row.cells).map((cell) => (cell.textContent || "").trim()) : [];
+        const conflictText = rowCells[8] || '';
+        const capacityText = rowCells[7] || '';
         teachingClasses.push({
           row: row,
           info: classInfo,
           button: selectButton,
           courseCode: targetCourseCodeOrName,
+          rowCells,
+          conflictText,
+          capacityText,
         });
       }
     };
 
-    // 方法1：直接遍历所有教学班行，按课程号或课程名称匹配
-    const allRows = document.querySelectorAll("table tbody tr.body_tr");
-
-    for (let row of allRows) {
+    const tableRows = courseDoc.querySelectorAll('table tbody tr');
+    for (let row of tableRows) {
       if (isRowMatchingCourse(row, input)) {
         pushTeachingClass(row);
       }
     }
 
-    // 方法2：新版页面的教学班行可能不再包含课程号，改从匹配的课程头所在区域收集行
+    const bodyRows = courseDoc.querySelectorAll('table tbody tr.body_tr');
+    for (let row of bodyRows) {
+      if (isRowMatchingCourse(row, input)) {
+        pushTeachingClass(row);
+      }
+    }
+
     if (teachingClasses.length === 0) {
-      const heads = findMatchingCourseHeads(input);
+      const heads = findMatchingCourseHeads(input, courseDoc);
       for (let head of heads) {
         const scopedRows = getTeachingRowsInCourseSection(head);
         for (let row of scopedRows) {
@@ -563,41 +608,25 @@
       }
     }
 
-    // 方法3：如果方法1/2都没找到，再尝试通过课程区域查找
     if (teachingClasses.length === 0) {
-      const isCode = isCourseCode(input);
-      // 查找包含目标课程的所有元素
-      const allElements = document.querySelectorAll("*");
+      const allElements = courseDoc.querySelectorAll('*');
       let courseSection = null;
-
-      // 首先找到课程主行
       for (let element of allElements) {
-        const text = element.textContent || "";
-        if (isCode) {
-          // 课程号匹配
-          if (text.includes(`(${input})`) || text.includes(input)) {
-            courseSection = element.closest("div, section, table");
-            break;
-          }
-        } else {
-          // 课程名称匹配
-          if (text.includes(input)) {
-            courseSection = element.closest("div, section, table");
-            break;
-          }
+        const text = element.textContent || '';
+        if (text.includes(input) || text.includes(`(${input})`)) {
+          courseSection = element.closest('div, section, table');
+          break;
         }
       }
 
       if (!courseSection) {
-        // 如果没找到课程区域，尝试表格行方式
-        const courseRows = document.querySelectorAll("table tbody tr");
+        const courseRows = courseDoc.querySelectorAll('table tbody tr');
         for (let row of courseRows) {
           if (isRowMatchingCourse(row, input)) {
-            // 找到匹配的行，查找同一表格中的所有教学班
-            const table = row.closest("table");
+            const table = row.closest('table');
             if (table) {
-              const tableRows = table.querySelectorAll("tbody tr");
-              for (let classRow of tableRows) {
+              const rows = table.querySelectorAll('tbody tr');
+              for (let classRow of rows) {
                 if (isRowMatchingCourse(classRow, input)) {
                   pushTeachingClass(classRow);
                 }
@@ -607,19 +636,20 @@
           }
         }
       } else {
-        // 在课程区域内查找所有教学班行
-        const classRows = courseSection.querySelectorAll("tr");
+        const classRows = courseSection.querySelectorAll('tr');
         for (let row of classRows) {
           pushTeachingClass(row);
         }
       }
     }
 
-    log(
-      `找到 ${teachingClasses.length} 个教学班`,
-      "info",
-      targetCourseCodeOrName,
-    );
+    if (teachingClasses.length > 0) {
+      const preview = teachingClasses[0].rowCells?.slice(0, 10).join(' | ') || teachingClasses[0].info?.rawText || '';
+      log(`找到 ${teachingClasses.length} 个可选课程行`, 'info', targetCourseCodeOrName);
+      log(`课程行预览: ${preview}`, 'info', targetCourseCodeOrName);
+    } else {
+      log(`未找到可选课程行`, 'warning', targetCourseCodeOrName);
+    }
     return teachingClasses;
   }
 
@@ -652,6 +682,53 @@
       Boolean(element.onclick) ||
       Boolean(element.getAttribute("onclick"))
     );
+  }
+
+  function activateElement(element) {
+    if (!element) {
+      return false;
+    }
+
+    const doc = element.ownerDocument || document;
+    const view = doc.defaultView || window;
+
+    try {
+      element.scrollIntoView?.({ block: "center", inline: "center" });
+    } catch (e) {}
+
+    try {
+      const onclick = element.getAttribute?.("onclick");
+      if (onclick) {
+        return Function(onclick).call(view);
+      }
+
+      const href = element.getAttribute?.("href") || "";
+      if (href.startsWith("javascript:")) {
+        const js = href.replace(/^javascript:\s*/i, "");
+        if (js) {
+          return Function(js).call(view);
+        }
+      }
+
+      const clickMethod = element.click;
+      if (typeof clickMethod === "function") {
+        return clickMethod.call(element);
+      }
+
+      element.dispatchEvent(
+        new MouseEvent("click", { bubbles: true, cancelable: true, view }),
+      );
+      return true;
+    } catch (e) {
+      try {
+        element.dispatchEvent(
+          new MouseEvent("click", { bubbles: true, cancelable: true, view }),
+        );
+        return true;
+      } catch (err) {
+        return false;
+      }
+    }
   }
 
   function findClickableElementByText(root, targetText, excludedTexts = []) {
@@ -836,29 +913,30 @@
       let capacity = "";
       let timeInfo = "";
 
-      // 记录原始文本用于调试
       const fullText = row.textContent || row.innerText || "";
 
-      // 优先使用表格特定类名提取信息（更准确）
-      // .jxbmc - 教学班名称
+      if (row?.cells?.length >= 8) {
+        className = row.cells[1]?.textContent?.trim() || className;
+        teacher = row.cells[3]?.textContent?.trim() || teacher;
+        timeInfo = row.cells[4]?.textContent?.trim() || timeInfo;
+        capacity = row.cells[7]?.textContent?.trim() || capacity;
+      }
+
       const jxbmcEl = row.querySelector(".jxbmc, td.jxbmc");
       if (jxbmcEl) {
         className = jxbmcEl.textContent.trim();
       }
 
-      // .jsxmzc - 上课教师（格式：【教师名】职称）
       const jsxmzcEl = row.querySelector(".jsxmzc, td.jsxmzc");
       if (jsxmzcEl) {
         teacher = jsxmzcEl.textContent.trim();
       }
 
-      // .sksj - 上课时间
       const sksjEl = row.querySelector(".sksj, td.sksj");
       if (sksjEl) {
         timeInfo = sksjEl.textContent.trim();
       }
 
-      // .rsxx - 已选/容量（格式：【36/50】）
       const rsxxEl = row.querySelector(".rsxx, td.rsxx");
       if (rsxxEl) {
         capacity = rsxxEl.textContent.trim();
@@ -934,7 +1012,7 @@
 
       // 更宽松的信息检查 - 只要有按钮就认为是有效的教学班
       const hasButton =
-        row.querySelector('button, a, input[type="button"]') !== null;
+        row.querySelector('a[href*="xsxkFun"], button, a, input[type="button"]') !== null;
 
       // 生成唯一ID（优先使用 jxb_id）
       const jxbIdEl = row.querySelector(".jxb_id, div.jxb_id");
@@ -982,20 +1060,28 @@
         return false;
       }
 
-      // 检查 .full 元素是否可见
-      const fullElement = teachingClass.row.querySelector(".full, td.full");
+      const row = teachingClass.row;
+      const capacityText = teachingClass.info?.capacity || row.cells?.[7]?.textContent?.trim() || '';
+      const conflictText = row.cells?.[8]?.textContent?.trim() || '';
+      if (/^\d+$/.test(capacityText)) {
+        return Number(capacityText) > 0;
+      }
+
+      const fullElement = row.querySelector(".full, td.full");
       if (fullElement) {
         const style = window.getComputedStyle(fullElement);
         const isVisible =
           style.display !== "none" && style.visibility !== "hidden";
-        // 如果"已满"可见，返回 false
         if (isVisible) {
           return false;
         }
       }
 
-      // "已满"不可见，可以选课
-      return true;
+      if (/冲突/.test(conflictText)) {
+        return false;
+      }
+
+      return !/已满|无余量|0\/?0?/.test(capacityText);
     } catch (error) {
       return false;
     }
@@ -1004,7 +1090,6 @@
   // 检查是否出现时间冲突警告
   function checkTimeConflictWarning() {
     try {
-      // 检查页面中是否出现时间冲突警告
       const warningTexts = [
         "所选教学班的上课时间与其他教学班有冲突",
         "上课时间与其他教学班有冲突",
@@ -1012,26 +1097,27 @@
         "时间有冲突",
       ];
 
-      // 查找所有可能包含警告文本的元素
-      const allElements = document.querySelectorAll("*");
-      for (let element of allElements) {
-        const text = element.textContent || element.innerText || "";
-        for (let warningText of warningTexts) {
-          if (text.includes(warningText)) {
-            return true;
+      const docs = [document, getCourseDocument()].filter(Boolean);
+      for (let currentDoc of docs) {
+        const allElements = currentDoc.querySelectorAll('*');
+        for (let element of allElements) {
+          const text = element.textContent || element.innerText || '';
+          for (let warningText of warningTexts) {
+            if (text.includes(warningText)) {
+              return true;
+            }
           }
         }
-      }
 
-      // 检查弹窗或模态框中的警告
-      const modals = document.querySelectorAll(
-        '.modal, .dialog, .alert, [role="dialog"], [role="alert"]',
-      );
-      for (let modal of modals) {
-        const modalText = modal.textContent || modal.innerText || "";
-        for (let warningText of warningTexts) {
-          if (modalText.includes(warningText)) {
-            return true;
+        const modals = currentDoc.querySelectorAll(
+          '.modal, .dialog, .alert, [role="dialog"], [role="alert"]',
+        );
+        for (let modal of modals) {
+          const modalText = modal.textContent || modal.innerText || '';
+          for (let warningText of warningTexts) {
+            if (modalText.includes(warningText)) {
+              return true;
+            }
           }
         }
       }
@@ -1144,17 +1230,19 @@
         }
 
         log(`找到退选按钮，正在点击...`, "info", courseCode);
-        dropButton.click();
+        activateElement(dropButton);
 
         // 等待模态框出现并确认退选
         setTimeout(() => {
           log(`等待退选确认模态框...`, "info", courseCode);
 
+          const dropDoc = row.ownerDocument || getCourseDocument();
+
           // 多种方式查找模态框中的确定按钮
           let confirmButton = null;
 
           // 方法1: 查找模态框内的确定按钮（优先）
-          const modals = document.querySelectorAll(
+          const modals = dropDoc.querySelectorAll(
             '.modal, .bootbox, [role="dialog"]',
           );
           for (let modal of modals) {
@@ -1194,7 +1282,7 @@
 
           // 方法2: 直接查找带有特定ID的确定按钮
           if (!confirmButton) {
-            confirmButton = document.querySelector(
+            confirmButton = dropDoc.querySelector(
               '#btn_ok, button[data-bb-handler="ok"], button[data-bb-handler="confirm"]',
             );
             if (confirmButton) {
@@ -1204,7 +1292,7 @@
 
           // 方法3: 查找所有可见的确定按钮（最后备选）
           if (!confirmButton) {
-            const allButtons = document.querySelectorAll(
+            const allButtons = dropDoc.querySelectorAll(
               'button, input[type="button"], a.btn',
             );
             for (let btn of allButtons) {
@@ -1229,7 +1317,7 @@
 
           if (confirmButton) {
             log(`正在点击确定按钮...`, "info", courseCode);
-            confirmButton.click();
+            activateElement(confirmButton);
 
             // 等待退选操作完成
             setTimeout(() => {
@@ -1251,6 +1339,9 @@
   // 尝试选择教学班
   function selectTeachingClass(teachingClass) {
     if (!teachingClass || !teachingClass.row) return false;
+
+    const row = teachingClass.row;
+    const courseDoc = row.ownerDocument || getCourseDocument();
 
     const courseCode = teachingClass.courseCode;
     const classId = teachingClass.info.id;
@@ -1274,62 +1365,33 @@
       );
       log(`时间: ${teachingClass.info.timeInfo}`, "info", courseCode);
       log(`容量: ${teachingClass.info.capacity}`, "info", courseCode);
+      if (teachingClass.conflictText) {
+        log(`冲突提示: ${teachingClass.conflictText}`, "info", courseCode);
+      }
 
       // 标记正在选课
       state.selecting = true;
 
       // 查找该行中真正的选课按钮或链接
-      const row = teachingClass.row;
       const rowText = row.textContent || "";
 
-      // 查找包含"选课"文本的元素 - 更精确的查找逻辑
-      let selectElement = null;
-      const allElements = row.querySelectorAll("*");
+      let selectElement =
+        row.querySelector('a[href*="xsxkFun"]') ||
+        teachingClass.button ||
+        null;
 
-      // 优先级1: 查找明确的"选课"文本
-      for (let element of allElements) {
-        const elementText = element.textContent.trim();
-        if (elementText === "选课") {
-          // 确保不是退选按钮，且是可点击的
-          if (
-            !elementText.includes("退选") &&
-            (element.tagName === "BUTTON" ||
-              element.tagName === "A" ||
-              element.onclick ||
-              element.getAttribute("onclick"))
-          ) {
-            selectElement = element;
-            break;
-          }
-        }
+      if (!selectElement) {
+        const textCandidates = Array.from(row.querySelectorAll("button, a, input[type='button'], [onclick]"));
+        selectElement = textCandidates.find((element) => {
+          const text = (element.textContent || "").trim();
+          return text.includes("选课") && !text.includes("退选");
+        }) || null;
       }
 
-      // 优先级2: 查找包含"选课"的可点击元素
       if (!selectElement) {
-        for (let element of allElements) {
-          const elementText = element.textContent.trim();
-          if (elementText.includes("选课") && !elementText.includes("退选")) {
-            if (
-              element.tagName === "BUTTON" ||
-              element.tagName === "A" ||
-              element.onclick ||
-              element.getAttribute("onclick")
-            ) {
-              selectElement = element;
-              break;
-            }
-          }
-        }
-      }
-
-      // 优先级3: 查找可点击的按钮或链接（但要排除明确的退选或其他功能）
-      if (!selectElement) {
-        const clickableElements = row.querySelectorAll(
-          'button, a, input[type="button"], [onclick]',
-        );
+        const clickableElements = row.querySelectorAll('button, a, input[type="button"], [onclick]');
         for (let element of clickableElements) {
           const elementText = element.textContent.trim();
-          // 只有在排除了明确的其他功能按钮后才选择
           if (
             !elementText.includes("退选") &&
             !elementText.includes("详情") &&
@@ -1355,14 +1417,14 @@
         state.tried.add(classId);
 
         // 点击选课元素
-        selectElement.click();
+        activateElement(selectElement);
 
         // 等待并检查结果
         setTimeout(() => {
           // 首先检查是否有时间冲突警告
           if (checkTimeConflictWarning()) {
             log(
-              `🛑 教学班 ${teachingClass.info.className} 时间冲突！`,
+              `🛑 教学班 ${teachingClass.info.className} 时间冲突或系统限制！`,
               "error",
               courseCode,
             );
@@ -1371,7 +1433,7 @@
             state.conflicted.add(classId);
 
             // 尝试关闭警告弹窗
-            const cancelButtons = document.querySelectorAll(
+            const cancelButtons = courseDoc.querySelectorAll(
               'button, input[type="button"], a',
             );
             for (let btn of cancelButtons) {
@@ -1381,7 +1443,7 @@
                 text.includes("关闭") ||
                 text.includes("确定")
               ) {
-                btn.click();
+                activateElement(btn);
                 log("已关闭时间冲突警告弹窗", "info", courseCode);
                 break;
               }
@@ -1393,7 +1455,7 @@
           }
 
           // 如果没有时间冲突，查找并点击确认按钮
-          const confirmButtons = document.querySelectorAll(
+          const confirmButtons = courseDoc.querySelectorAll(
             'button, input[type="button"], a',
           );
           for (let btn of confirmButtons) {
@@ -1411,14 +1473,14 @@
               setTimeout(() => {
                 if (checkTimeConflictWarning()) {
                   log(
-                    `🛑 确认后检测到时间冲突: ${teachingClass.info.className}`,
+                    `🛑 确认后检测到系统拒绝/冲突: ${teachingClass.info.className}`,
                     "error",
                     courseCode,
                   );
                   state.conflicted.add(classId);
 
                   // 关闭冲突警告
-                  const closeButtons = document.querySelectorAll(
+                  const closeButtons = courseDoc.querySelectorAll(
                     'button, input[type="button"], a',
                   );
                   for (let closeBtn of closeButtons) {
@@ -1553,7 +1615,7 @@
       }
       __CG_GLOBAL__[__CG_REFRESH_LOCK_KEY__] = now;
 
-      const searchBtn = document.querySelector(
+      const searchBtn = getCourseDocument().querySelector(
         'button[onclick*="search"], input[value*="搜索"], input[value*="查询"]',
       );
       if (searchBtn) {
@@ -1949,15 +2011,10 @@
     }, CHECK_INTERVAL);
   }
 
-  // 停止抢课
-  function stopGrabbing() {
-    if (!isRunning) {
-      log("抢课脚本未运行", "info");
-      return;
-    }
-
+  function disposeGrabbingRuntime() {
     isRunning = false;
     refreshInProgress = false;
+
     if (intervalId) {
       clearInterval(intervalId);
       intervalId = null;
@@ -1966,7 +2023,61 @@
       clearTimeout(refreshTimeoutId);
       refreshTimeoutId = null;
     }
+    if (schedulerIntervalId) {
+      clearInterval(schedulerIntervalId);
+      schedulerIntervalId = null;
+    }
 
+    scheduledTime = null;
+    isScheduled = false;
+
+    const startBtn = document.getElementById("cg-start-btn");
+    const stopBtn = document.getElementById("cg-stop-btn");
+    const scheduleBtn = document.getElementById("cg-schedule-btn");
+    const timerDisplay = document.getElementById("cg-timer-display");
+
+    if (startBtn) startBtn.disabled = false;
+    if (stopBtn) stopBtn.disabled = true;
+    if (scheduleBtn) {
+      scheduleBtn.textContent = "⏰ 设置";
+      scheduleBtn.onclick = () => {
+        const timeInput = document.getElementById("cg-schedule-time");
+        const timeValue = timeInput.value;
+
+        if (!timeValue) {
+          alert("请先选择开抢时间！");
+          return;
+        }
+
+        const scheduleTime = new Date(timeValue);
+        const now = new Date();
+
+        if (scheduleTime <= now) {
+          alert("开抢时间必须大于当前时间！");
+          return;
+        }
+
+        if (TARGET_COURSES.length === 0) {
+          alert("请先添加至少一门课程！");
+          return;
+        }
+
+        setScheduledStart(scheduleTime);
+      };
+    }
+    if (timerDisplay) {
+      timerDisplay.style.display = "none";
+    }
+  }
+
+  // 停止抢课
+  function stopGrabbing() {
+    if (!isRunning && !isScheduled && !intervalId && !refreshTimeoutId && !schedulerIntervalId) {
+      log("抢课脚本未运行", "info");
+      return;
+    }
+
+    disposeGrabbingRuntime();
     log("⏹️ 抢课脚本已停止", "warning");
   }
 
@@ -2052,6 +2163,17 @@
   }
 
   // 暴露全局控制接口
+  __CG_GLOBAL__[__CG_CLEANUP_KEY__] = (reason = "manual") => {
+    disposeGrabbingRuntime();
+    if (reason === "reload") {
+      try {
+        log("旧实例已被新脚本覆盖前清理", "warning");
+      } catch (e) {
+        // ignore
+      }
+    }
+  };
+
   window.grab = {
     // 开始抢课 - 可以传入自定义课程列表
     // 示例: grab.start([{code: 'CS101', priority: 1}, {code: 'CS102', priority: 2}])
