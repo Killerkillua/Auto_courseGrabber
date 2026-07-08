@@ -55,21 +55,81 @@
   // 假如使用猴子补丁，可能会导致原先系统中的功能出错，还是选择耦合度低、入侵性小的方案
   const nativeArrayFilter = Array.prototype.filter;
   const nativeArrayMap = Array.prototype.map;
-  const nativeWindowConfirm = typeof window !== "undefined" ? window.confirm.bind(window) : null;
-  if (typeof window !== "undefined" && nativeWindowConfirm) {
-    window.confirm = function patchedConfirm(message) {
-      const text = String(message || "");
-      if (
-        text.includes("确认选择当前课程班级") ||
-        text.includes("你确认选择当前课程班级") ||
-        text.includes("当前已选择学分") ||
-        text.includes("最高选课学分") ||
-        text.includes("选课失败")
-      ) {
-        return true;
+  const __CG_NATIVE_CONFIRM_PATCHED__ = "__AUTO_COURSE_GRABBER_NATIVE_CONFIRM_PATCHED__";
+  const __CG_NATIVE_ALERT_PATCHED__ = "__AUTO_COURSE_GRABBER_NATIVE_ALERT_PATCHED__";
+
+  function patchNativeDialogs(targetWindow = window, visitedWindows = new WeakSet()) {
+    if (!targetWindow || visitedWindows.has(targetWindow)) return;
+    visitedWindows.add(targetWindow);
+
+    try {
+      const originalConfirm = targetWindow.confirm?.bind(targetWindow);
+      if (originalConfirm && !targetWindow[__CG_NATIVE_CONFIRM_PATCHED__]) {
+        targetWindow.confirm = function patchedConfirm(message) {
+          const text = String(message || "");
+          if (targetWindow.__AUTO_COURSE_GRABBER_RUNNING__ || __CG_GLOBAL__.__AUTO_COURSE_GRABBER_RUNNING__) {
+            console.log("[抢课脚本] 自动确认原生 confirm:", text);
+            return true;
+          }
+          return originalConfirm(text);
+        };
+        targetWindow[__CG_NATIVE_CONFIRM_PATCHED__] = true;
       }
-      return nativeWindowConfirm(text);
-    };
+    } catch (e) {}
+
+    try {
+      const originalAlert = targetWindow.alert?.bind(targetWindow);
+      if (originalAlert && !targetWindow[__CG_NATIVE_ALERT_PATCHED__]) {
+        targetWindow.alert = function patchedAlert(message) {
+          const text = String(message || "");
+          if (targetWindow.__AUTO_COURSE_GRABBER_RUNNING__ || __CG_GLOBAL__.__AUTO_COURSE_GRABBER_RUNNING__) {
+            console.log("[抢课脚本] 已拦截系统弹窗:", text);
+            return;
+          }
+          return originalAlert(text);
+        };
+        targetWindow[__CG_NATIVE_ALERT_PATCHED__] = true;
+      }
+    } catch (e) {}
+
+    try {
+      const frames = Array.from(targetWindow.document?.querySelectorAll?.("iframe, frame") || []);
+      for (let frameEl of frames) {
+        try {
+          const frameWindow = frameEl.contentWindow;
+          if (frameWindow) patchNativeDialogs(frameWindow, visitedWindows);
+        } catch (e) {}
+      }
+    } catch (e) {}
+
+    try {
+      const opener = targetWindow.opener;
+      if (opener) patchNativeDialogs(opener, visitedWindows);
+    } catch (e) {}
+  }
+
+  function patchNativeDialogsAcrossKnownWindows() {
+    const visitedWindows = new WeakSet();
+    const candidates = [window];
+    try { if (window.top && window.top !== window) candidates.push(window.top); } catch (e) {}
+    try { if (window.parent && window.parent !== window) candidates.push(window.parent); } catch (e) {}
+    try { if (window.opener && window.opener !== window) candidates.push(window.opener); } catch (e) {}
+
+    for (const win of candidates) {
+      try {
+        patchNativeDialogs(win, visitedWindows);
+      } catch (e) {}
+    }
+  }
+
+  if (typeof window !== "undefined") {
+    patchNativeDialogsAcrossKnownWindows();
+    try {
+      new MutationObserver(() => patchNativeDialogsAcrossKnownWindows()).observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+      });
+    } catch (e) {}
   }
 
   /**
@@ -252,6 +312,49 @@
     const mainFrame = root.querySelector?.('#mainFrame');
     const kbFrame = root.querySelector?.('#kbFrame');
     return mainFrame?.contentDocument || kbFrame?.contentDocument || root;
+  }
+
+  function collectCandidateDocuments(root = document) {
+    const docs = [];
+    const seen = new Set();
+    const addDoc = (doc) => {
+      if (!doc || seen.has(doc)) return;
+      seen.add(doc);
+      docs.push(doc);
+    };
+
+    const pushFrameDocs = (doc) => {
+      if (!doc) return;
+      addDoc(doc);
+      try {
+        const frameEls = Array.from(doc.querySelectorAll?.('iframe, frame') || []);
+        for (let frameEl of frameEls) {
+          try {
+            const frameDoc = frameEl.contentDocument || frameEl.contentWindow?.document;
+            if (frameDoc) {
+              addDoc(frameDoc);
+              pushFrameDocs(frameDoc);
+            }
+          } catch (e) {}
+        }
+      } catch (e) {}
+    };
+
+    pushFrameDocs(root);
+
+    try {
+      addDoc(window.document);
+    } catch (e) {}
+    try {
+      addDoc(window.top?.document);
+      pushFrameDocs(window.top?.document);
+    } catch (e) {}
+    try {
+      addDoc(window.parent?.document);
+      pushFrameDocs(window.parent?.document);
+    } catch (e) {}
+
+    return docs;
   }
 
   function getCourseDocument() {
@@ -1194,8 +1297,9 @@
   const __CG_DIALOG_WATCHERS__ = new Map();
 
   function autoConfirmSelectionDialogs(preferredDoc = getCourseDocument()) {
-    const docs = [preferredDoc, document].filter(Boolean);
-    const confirmTexts = ["确定", "确认", "OK", "好的", "是", "继续", "提交"];
+    const docs = collectCandidateDocuments(preferredDoc || document);
+    const confirmTexts = ["确定", "确认", "OK", "好的", "是", "继续", "提交", "我知道了", "仍要继续", "同意"];
+    const cancelTexts = ["取消", "返回", "关闭", "否", "我再想想"];
     const dialogSelectors = [
       '.modal',
       '.dialog',
@@ -1203,6 +1307,7 @@
       '.bootbox',
       '[role="dialog"]',
       '[role="alert"]',
+      '[aria-modal="true"]',
       '.layui-layer',
       '.layui-layer-dialog',
       '.ui-dialog',
@@ -1210,33 +1315,93 @@
       '.el-message-box',
       '.el-message-box__wrapper',
       '.message',
+      '.ant-modal',
+      '.ant-modal-wrap',
+      '.v-modal',
+      '.ui-popup',
+      '.popup',
+      '[class*="modal"]',
+      '[class*="dialog"]',
+      '[class*="popup"]',
+      '[class*="layer"]',
     ].join(', ');
     const dialogMatchers = [
       "确认选择当前课程班级",
       "你确认选择当前课程班级",
       "当前已选择学分",
       "还剩",
+      "学分",
       "最高选课学分",
       "选课失败",
       "时间冲突",
       "提示",
       "确认",
       "请选择",
+      "是否确定",
+      "确认所选课程",
+      "确认选课",
+      "确定要继续",
+      "是否继续",
+      "是否提交",
     ];
 
-    const normalizeText = (value) => String(value || "").replace(/\s+/g, "").trim();
+    const normalizeText = (value) => String(value || "").replace(/\s+/g, "").trim().toLowerCase();
+    const describeNode = (node) => {
+      if (!node) return "null";
+      const tag = String(node.tagName || "").toLowerCase() || "unknown";
+      const cls = String(node.className || "").trim().replace(/\s+/g, " ");
+      const id = String(node.id || "").trim();
+      const role = String(node.getAttribute?.("role") || "").trim();
+      const ariaModal = String(node.getAttribute?.("aria-modal") || "").trim();
+      const text = normalizeText(node.textContent || node.innerText || "").slice(0, 120);
+      return `${tag}${id ? `#${id}` : ""}${cls ? `.${cls}` : ""}${role ? ` role=${role}` : ""}${ariaModal ? ` aria-modal=${ariaModal}` : ""}${text ? ` text=${text}` : ""}`;
+    };
+    const logDialogInspection = (currentDoc, dialog) => {
+      try {
+        const win = currentDoc.defaultView || window;
+        const container = dialog?.parentElement || dialog;
+        const buttons = Array.from(dialog?.querySelectorAll?.("button, input, a, [role='button']") || []).slice(0, 8);
+        const buttonInfo = buttons.map((btn) => {
+          const text = normalizeText(btn.innerText || btn.textContent || btn.value || btn.getAttribute?.("aria-label") || btn.title || "");
+          return text || describeNode(btn);
+        });
+        const frameCount = currentDoc.querySelectorAll?.("iframe, frame")?.length || 0;
+        log(
+          `弹窗识别日志 | window=${win === window ? "current" : "other"} | doc=${currentDoc.location?.href || "unknown"} | container=${describeNode(container)} | dialog=${describeNode(dialog)} | buttons=[${buttonInfo.join(" | ")}] | frames=${frameCount}`,
+          "info",
+        );
+      } catch (e) {
+        log(`弹窗识别日志获取失败: ${String(e?.message || e)}`, "warning");
+      }
+    };
     const normalizedMatchers = dialogMatchers.map((item) => normalizeText(item));
     const normalizedConfirmTexts = confirmTexts.map((item) => normalizeText(item));
+    const normalizedCancelTexts = cancelTexts.map((item) => normalizeText(item));
+    const buttonSelectors = [
+      'button',
+      'input[type="button"]',
+      'input[type="submit"]',
+      'a',
+      '[role="button"]',
+      '.btn',
+      '.el-button',
+      '.ant-btn',
+      '.layui-layer-btn0',
+      '.layui-layer-btn a',
+      '.confirm',
+      '.ok',
+    ].join(', ');
 
     const isVisible = (currentDoc, el) => {
       try {
         const style = currentDoc.defaultView?.getComputedStyle(el);
         if (!style) return true;
+        const rect = el.getBoundingClientRect?.();
         return (
           style.display !== "none" &&
           style.visibility !== "hidden" &&
           style.opacity !== "0" &&
-          el.offsetParent !== null
+          rect && rect.width > 0 && rect.height > 0
         );
       } catch (e) {
         return true;
@@ -1251,35 +1416,100 @@
     const isSelectionConfirmDialog = (text) =>
       normalizedMatchers.some((matcher) => text.includes(matcher));
 
-    const clickIfMatch = (currentDoc, el, force = false) => {
+    const activateClick = (currentDoc, el) => {
       if (!el || !isVisible(currentDoc, el)) return false;
-      const text = getButtonText(el);
-      const dialogHost = el.closest(dialogSelectors) || el.parentElement || el.ownerDocument?.body || el;
-      const context = normalizeText(dialogHost.textContent || "");
-      const hasConfirmText = normalizedConfirmTexts.some((t) => text.includes(t));
-      const hasDialogText = isSelectionConfirmDialog(context);
-      if (!force && !hasConfirmText && !hasDialogText) return false;
-      log(`自动点击确认按钮: ${text || el.id || 'unknown'}`, "info");
+      try { el.scrollIntoView?.({ block: "center", inline: "center" }); } catch (e) {}
+      try { el.focus?.(); } catch (e) {}
+      const win = currentDoc.defaultView || window;
+      const eventInit = { bubbles: true, cancelable: true, view: win, composed: true };
+      try { el.dispatchEvent(new win.PointerEvent("pointerdown", eventInit)); } catch (e) {}
+      try { el.dispatchEvent(new win.MouseEvent("mousedown", eventInit)); } catch (e) {}
+      try { el.dispatchEvent(new win.PointerEvent("pointerup", eventInit)); } catch (e) {}
+      try { el.dispatchEvent(new win.MouseEvent("mouseup", eventInit)); } catch (e) {}
+      try { el.dispatchEvent(new win.MouseEvent("click", eventInit)); } catch (e) {}
+      try { el.click?.(); } catch (e) {}
       activateElement(el);
       return true;
     };
 
+    const isConfirmCandidate = (text, tag, value = "") =>
+      normalizedConfirmTexts.some((t) => text.includes(t) || (tag === "input" && normalizeText(value).includes(t)));
+
+    const isCancelCandidate = (text) => normalizedCancelTexts.some((t) => text.includes(t));
+
+    const findClickableAncestor = (currentDoc, el) => {
+      let node = el;
+      for (let i = 0; node && i < 4; i += 1, node = node.parentElement) {
+        const tag = String(node.tagName || "").toLowerCase();
+        const role = String(node.getAttribute?.("role") || "").toLowerCase();
+        const hasHandler = typeof node.onclick === "function" || node.getAttribute?.("onclick") || node.getAttribute?.("role") === "button" || node.hasAttribute?.("tabindex");
+        if ((tag === "button" || tag === "a" || tag === "input") || role === "button" || hasHandler) {
+          if (isVisible(currentDoc, node)) return node;
+        }
+      }
+      return el;
+    };
+
+    const tryClickInside = (currentDoc, root) => {
+      const buttons = root.querySelectorAll(buttonSelectors);
+      const candidates = Array.from(buttons).filter((btn) => {
+        const text = getButtonText(btn);
+        const tag = String(btn.tagName || "").toLowerCase();
+        return isConfirmCandidate(text, tag, btn?.value || "") && !isCancelCandidate(text);
+      });
+      for (let btn of candidates) {
+        const target = findClickableAncestor(currentDoc, btn);
+        log(`自动点击确认按钮: ${getButtonText(target) || target.id || 'unknown'}`, "info");
+        if (activateClick(currentDoc, target)) return true;
+      }
+
+      const textNodes = Array.from(root.querySelectorAll("span, div, p, em, strong, i, label, small, td, li"));
+      for (let node of textNodes) {
+        const text = getButtonText(node);
+        if (!isConfirmCandidate(text, String(node.tagName || "").toLowerCase())) continue;
+        const target = findClickableAncestor(currentDoc, node);
+        if (!isCancelCandidate(getButtonText(target)) && activateClick(currentDoc, target)) return true;
+      }
+      return false;
+    };
+
     for (let currentDoc of docs) {
       const dialogRoots = Array.from(currentDoc.querySelectorAll(dialogSelectors));
+      let matchedDialogFound = false;
       for (let dialog of dialogRoots) {
         const dialogText = normalizeText(dialog.textContent || "");
         if (!isSelectionConfirmDialog(dialogText)) continue;
-        const buttons = dialog.querySelectorAll('button, input[type="button"], a');
-        for (let btn of buttons) {
-          if (clickIfMatch(currentDoc, btn)) return true;
-        }
+        matchedDialogFound = true;
+        log(`检测到选课确认弹窗: ${dialogText.slice(0, 120)}`, "info");
+        logDialogInspection(currentDoc, dialog);
+        if (tryClickInside(currentDoc, dialog)) return true;
       }
 
-      const candidates = currentDoc.querySelectorAll('button, input[type="button"], a');
-      for (let btn of candidates) {
-        const text = getButtonText(btn);
-        if (!normalizedConfirmTexts.some((t) => text.includes(t))) continue;
-        if (clickIfMatch(currentDoc, btn)) return true;
+      if (matchedDialogFound) {
+        const visibleButtons = Array.from(currentDoc.querySelectorAll(buttonSelectors)).filter((btn) => {
+          const text = getButtonText(btn);
+          const tag = String(btn.tagName || "").toLowerCase();
+          return isVisible(currentDoc, btn) && isConfirmCandidate(text, tag, btn?.value || "") && !isCancelCandidate(text);
+        });
+        for (let btn of visibleButtons) {
+          log(`全局兜底点击确认按钮: ${getButtonText(btn) || btn.id || 'unknown'}`, "info");
+          if (activateClick(currentDoc, btn)) return true;
+        }
+
+        const fallbackCandidates = Array.from(currentDoc.querySelectorAll("button, input[type='button'], input[type='submit'], a, [role='button']")).filter((el) => {
+          const txt = getButtonText(el);
+          return isVisible(currentDoc, el) && txt && !isCancelCandidate(txt) && (txt.includes("确定") || txt.includes("确认") || txt.includes("继续") || txt.includes("同意") || txt.includes("提交"));
+        });
+        if (fallbackCandidates.length) {
+          log(`弹窗兜底候选按钮: ${fallbackCandidates.map((el) => getButtonText(el) || el.id || 'unknown').join(' | ')}`, "info");
+        }
+        for (let btn of fallbackCandidates) {
+          if (activateClick(currentDoc, btn)) return true;
+        }
+
+        try {
+          currentDoc.activeElement?.dispatchEvent?.(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+        } catch (e) {}
       }
     }
 
@@ -1287,7 +1517,7 @@
   }
 
   function startDialogAutoConfirmWatchers() {
-    const docs = [getCourseDocument(), document].filter(Boolean);
+    const docs = collectCandidateDocuments(getCourseDocument() || document);
     for (let currentDoc of docs) {
       if (__CG_DIALOG_WATCHERS__.has(currentDoc)) continue;
 
@@ -1307,7 +1537,11 @@
         });
       } catch (e) {}
 
-      const timer = setInterval(run, 120);
+      const timer = setInterval(() => {
+        try {
+          run();
+        } catch (e) {}
+      }, 80);
       __CG_DIALOG_WATCHERS__.set(currentDoc, { observer, timer });
       run();
     }
@@ -1612,9 +1846,8 @@
         // 点击选课元素
         activateElement(selectElement);
         log("已触发选课链接，正在尝试自动确认弹窗...", "info", courseCode);
-        setTimeout(() => autoConfirmSelectionDialogs(courseDoc), 0);
-        setTimeout(() => autoConfirmSelectionDialogs(courseDoc), 80);
-        setTimeout(() => autoConfirmSelectionDialogs(courseDoc), 180);
+
+        setTimeout(() => autoConfirmSelectionDialogs(courseDoc), 100);
 
         // 等待并检查结果
         setTimeout(() => {
@@ -2104,6 +2337,10 @@
     startDialogAutoConfirmWatchers();
 
     isRunning = true;
+    window.__AUTO_COURSE_GRABBER_RUNNING__ = true;
+    try {
+      patchNativeDialogsAcrossKnownWindows();
+    } catch (e) {}
     attemptCount = 0;
     refreshInProgress = false;
     if (refreshTimeoutId) {
@@ -2213,6 +2450,7 @@
 
   function disposeGrabbingRuntime() {
     isRunning = false;
+    window.__AUTO_COURSE_GRABBER_RUNNING__ = false;
     refreshInProgress = false;
 
     if (intervalId) {
