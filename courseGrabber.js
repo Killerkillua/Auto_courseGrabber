@@ -1,4 +1,4 @@
-// 仓库地址（持续维护、更新中）: https://github.com/ceilf6/Auto_courseGrabber
+﻿// 仓库地址（持续维护、更新中）: https://github.com/ceilf6/Auto_courseGrabber
 // https://github.com/ceilf6
 // https://blog.csdn.net/2301_78856868
 
@@ -55,6 +55,22 @@
   // 假如使用猴子补丁，可能会导致原先系统中的功能出错，还是选择耦合度低、入侵性小的方案
   const nativeArrayFilter = Array.prototype.filter;
   const nativeArrayMap = Array.prototype.map;
+  const nativeWindowConfirm = typeof window !== "undefined" ? window.confirm.bind(window) : null;
+  if (typeof window !== "undefined" && nativeWindowConfirm) {
+    window.confirm = function patchedConfirm(message) {
+      const text = String(message || "");
+      if (
+        text.includes("确认选择当前课程班级") ||
+        text.includes("你确认选择当前课程班级") ||
+        text.includes("当前已选择学分") ||
+        text.includes("最高选课学分") ||
+        text.includes("选课失败")
+      ) {
+        return true;
+      }
+      return nativeWindowConfirm(text);
+    };
+  }
 
   /**
    * 安全的数组 filter 函数
@@ -164,6 +180,7 @@
   let scheduledTime = null; // 计划开抢时间
   let schedulerIntervalId = null; // 定时器ID
   let isScheduled = false; // 是否已设置定时
+  let scheduleModeEnabled = false; // 是否启用定时模式
 
   // ========== 工具函数 ==========
 
@@ -712,9 +729,15 @@
 
       const clickMethod = element.click;
       if (typeof clickMethod === "function") {
-        return clickMethod.call(element);
+        clickMethod.call(element);
       }
 
+      element.dispatchEvent(
+        new MouseEvent("mousedown", { bubbles: true, cancelable: true, view }),
+      );
+      element.dispatchEvent(
+        new MouseEvent("mouseup", { bubbles: true, cancelable: true, view }),
+      );
       element.dispatchEvent(
         new MouseEvent("click", { bubbles: true, cancelable: true, view }),
       );
@@ -1128,6 +1151,176 @@
     }
   }
 
+  function checkAlreadySelectedState(courseCode, teachingClass = null, root = getCourseDocument()) {
+    try {
+      const input = String(courseCode || '').trim();
+      const docs = [root, document].filter(Boolean);
+      const className = teachingClass?.info?.className || '';
+      const teacher = teachingClass?.info?.teacher || '';
+      const uniqueId = teachingClass?.info?.jxbId || teachingClass?.info?.id || '';
+
+      for (let currentDoc of docs) {
+        const selectedRows = findSelectedCourseRows(input, currentDoc);
+        for (let item of selectedRows) {
+          const rowText = item.row?.textContent || '';
+          const headingText = item.row?.closest('.outer_xkxx_list, [id^="right_"]')?.textContent || '';
+          const haystack = `${rowText} ${headingText}`;
+          if (
+            !input ||
+            haystack.includes(input) ||
+            (className && haystack.includes(className)) ||
+            (teacher && haystack.includes(teacher)) ||
+            (uniqueId && haystack.includes(uniqueId))
+          ) {
+            return true;
+          }
+        }
+
+        const selectedTextNodes = currentDoc.body ? currentDoc.body.textContent || '' : '';
+        if (input && selectedTextNodes.includes(input) && /退选|已选|已选择|已选上|选课成功/.test(selectedTextNodes)) {
+          return true;
+        }
+        if (className && selectedTextNodes.includes(className) && /退选|已选|已选择|已选上|选课成功/.test(selectedTextNodes)) {
+          return true;
+        }
+      }
+
+      return false;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  const __CG_DIALOG_WATCHERS__ = new Map();
+
+  function autoConfirmSelectionDialogs(preferredDoc = getCourseDocument()) {
+    const docs = [preferredDoc, document].filter(Boolean);
+    const confirmTexts = ["确定", "确认", "OK", "好的", "是", "继续", "提交"];
+    const dialogSelectors = [
+      '.modal',
+      '.dialog',
+      '.alert',
+      '.bootbox',
+      '[role="dialog"]',
+      '[role="alert"]',
+      '.layui-layer',
+      '.layui-layer-dialog',
+      '.ui-dialog',
+      '.swal2-popup',
+      '.el-message-box',
+      '.el-message-box__wrapper',
+      '.message',
+    ].join(', ');
+    const dialogMatchers = [
+      "确认选择当前课程班级",
+      "你确认选择当前课程班级",
+      "当前已选择学分",
+      "还剩",
+      "最高选课学分",
+      "选课失败",
+      "时间冲突",
+      "提示",
+      "确认",
+      "请选择",
+    ];
+
+    const normalizeText = (value) => String(value || "").replace(/\s+/g, "").trim();
+    const normalizedMatchers = dialogMatchers.map((item) => normalizeText(item));
+    const normalizedConfirmTexts = confirmTexts.map((item) => normalizeText(item));
+
+    const isVisible = (currentDoc, el) => {
+      try {
+        const style = currentDoc.defaultView?.getComputedStyle(el);
+        if (!style) return true;
+        return (
+          style.display !== "none" &&
+          style.visibility !== "hidden" &&
+          style.opacity !== "0" &&
+          el.offsetParent !== null
+        );
+      } catch (e) {
+        return true;
+      }
+    };
+
+    const getButtonText = (el) =>
+      normalizeText(
+        el?.innerText || el?.textContent || el?.value || el?.getAttribute?.("aria-label") || el?.title || "",
+      );
+
+    const isSelectionConfirmDialog = (text) =>
+      normalizedMatchers.some((matcher) => text.includes(matcher));
+
+    const clickIfMatch = (currentDoc, el, force = false) => {
+      if (!el || !isVisible(currentDoc, el)) return false;
+      const text = getButtonText(el);
+      const dialogHost = el.closest(dialogSelectors) || el.parentElement || el.ownerDocument?.body || el;
+      const context = normalizeText(dialogHost.textContent || "");
+      const hasConfirmText = normalizedConfirmTexts.some((t) => text.includes(t));
+      const hasDialogText = isSelectionConfirmDialog(context);
+      if (!force && !hasConfirmText && !hasDialogText) return false;
+      log(`自动点击确认按钮: ${text || el.id || 'unknown'}`, "info");
+      activateElement(el);
+      return true;
+    };
+
+    for (let currentDoc of docs) {
+      const dialogRoots = Array.from(currentDoc.querySelectorAll(dialogSelectors));
+      for (let dialog of dialogRoots) {
+        const dialogText = normalizeText(dialog.textContent || "");
+        if (!isSelectionConfirmDialog(dialogText)) continue;
+        const buttons = dialog.querySelectorAll('button, input[type="button"], a');
+        for (let btn of buttons) {
+          if (clickIfMatch(currentDoc, btn)) return true;
+        }
+      }
+
+      const candidates = currentDoc.querySelectorAll('button, input[type="button"], a');
+      for (let btn of candidates) {
+        const text = getButtonText(btn);
+        if (!normalizedConfirmTexts.some((t) => text.includes(t))) continue;
+        if (clickIfMatch(currentDoc, btn)) return true;
+      }
+    }
+
+    return false;
+  }
+
+  function startDialogAutoConfirmWatchers() {
+    const docs = [getCourseDocument(), document].filter(Boolean);
+    for (let currentDoc of docs) {
+      if (__CG_DIALOG_WATCHERS__.has(currentDoc)) continue;
+
+      const run = () => {
+        try {
+          autoConfirmSelectionDialogs(currentDoc);
+        } catch (e) {}
+      };
+
+      const observer = new MutationObserver(() => run());
+      try {
+        observer.observe(currentDoc.documentElement || currentDoc.body, {
+          childList: true,
+          subtree: true,
+          attributes: true,
+          characterData: true,
+        });
+      } catch (e) {}
+
+      const timer = setInterval(run, 120);
+      __CG_DIALOG_WATCHERS__.set(currentDoc, { observer, timer });
+      run();
+    }
+  }
+
+  function stopDialogAutoConfirmWatchers() {
+    for (let [, entry] of __CG_DIALOG_WATCHERS__) {
+      try { entry.observer?.disconnect?.(); } catch (e) {}
+      try { clearInterval(entry.timer); } catch (e) {}
+    }
+    __CG_DIALOG_WATCHERS__.clear();
+  }
+
   // 退选指定课程；courseCode 可为课程号或课程名，课程号匹配更安全
   function dropCourse(courseCode) {
     return new Promise((resolve) => {
@@ -1418,6 +1611,10 @@
 
         // 点击选课元素
         activateElement(selectElement);
+        log("已触发选课链接，正在尝试自动确认弹窗...", "info", courseCode);
+        setTimeout(() => autoConfirmSelectionDialogs(courseDoc), 0);
+        setTimeout(() => autoConfirmSelectionDialogs(courseDoc), 80);
+        setTimeout(() => autoConfirmSelectionDialogs(courseDoc), 180);
 
         // 等待并检查结果
         setTimeout(() => {
@@ -1500,22 +1697,21 @@
                   setTimeout(() => {
                     // 重新查找教学班，验证是否真的选上了
                     const updatedClasses = findAllTeachingClasses(courseCode);
-                    let reallySelected = false;
+                    const reallySelected =
+                      checkAlreadySelectedState(courseCode, teachingClass, courseDoc) ||
+                      updatedClasses.some((updatedClass) => {
+                        if (
+                          updatedClass.info.className !==
+                          teachingClass.info.className
+                        ) {
+                          return false;
+                        }
 
-                    for (let updatedClass of updatedClasses) {
-                      if (
-                        updatedClass.info.className ===
-                        teachingClass.info.className
-                      ) {
                         const updatedRowText = updatedClass.row
                           ? updatedClass.row.textContent
                           : "";
-                        if (updatedRowText.includes("退选")) {
-                          reallySelected = true;
-                          break;
-                        }
-                      }
-                    }
+                        return /退选|已选|已选择|已选上|选课成功/.test(updatedRowText);
+                      });
 
                     if (reallySelected) {
                       // 真正选课成功，重置失败计数器
@@ -1530,54 +1726,54 @@
                         courseCode,
                       );
 
-                      // 显示成功通知
+                      // 选课成功后不再弹出脚本自己的成功窗口，仅保留系统弹窗
+                      state.selecting = false;
                       try {
-                        if (
-                          window.Notification &&
-                          Notification.permission === "granted"
-                        ) {
-                          new Notification("抢课成功！", {
-                            body: `成功选择: ${courseCode} - ${teachingClass.info.className}`,
-                            icon: "/favicon.ico",
-                          });
-                        }
-
-                        // 检查是否所有课程都已完成
                         if (activeCourses.size === 0) {
-                          alert(
-                            `🎉 所有课程抢课完成！\n成功课程: ${Array.from(selectedCourses).join(", ")}`,
-                          );
                           stopGrabbing();
                         }
                       } catch (e) {
-                        // 忽略通知错误
+                        // 忽略状态收尾错误
                       }
                     } else {
-                      // 实际上没有选课成功，增加重试计数
-                      state.failed++;
-                      log(
-                        `⚠️ 选课请求已发送但未确认成功 (失败次数: ${state.failed}/${MAX_FAILED_ATTEMPTS})`,
-                        "warning",
-                        courseCode,
-                      );
-
-                      if (state.failed >= MAX_FAILED_ATTEMPTS) {
+                      // 如果页面已经显示已选中，但本次轮询未抓到，也直接视为成功，避免重复点击已成功课程
+                      if (checkAlreadySelectedState(courseCode, teachingClass, courseDoc)) {
+                        state.failed = 0;
+                        state.success = true;
+                        selectedCourses.add(courseCode);
+                        activeCourses.delete(courseCode);
                         log(
-                          `❌ 课程 ${courseCode} 连续失败 ${MAX_FAILED_ATTEMPTS} 次，停止该课程抢课`,
-                          "error",
+                          `🎊 检测到课程已成功选上，停止重复尝试: ${teachingClass.info.className}！`,
+                          "success",
                           courseCode,
                         );
-                        activeCourses.delete(courseCode);
+                      } else {
+                        // 实际上没有选课成功，增加重试计数
+                        state.failed++;
+                        log(
+                          `⚠️ 选课请求已发送但未确认成功 (失败次数: ${state.failed}/${MAX_FAILED_ATTEMPTS})`,
+                          "warning",
+                          courseCode,
+                        );
 
-                        // 检查是否所有课程都已完成
-                        if (
-                          activeCourses.size === 0 &&
-                          selectedCourses.size === 0
-                        ) {
-                          alert(
-                            `抢课脚本已停止\n原因: 所有课程都无法选课成功\n建议: 检查网络连接或手动刷新页面后重试`,
+                        if (state.failed >= MAX_FAILED_ATTEMPTS) {
+                          log(
+                            `❌ 课程 ${courseCode} 连续失败 ${MAX_FAILED_ATTEMPTS} 次，停止该课程抢课`,
+                            "error",
+                            courseCode,
                           );
-                          stopGrabbing();
+                          activeCourses.delete(courseCode);
+
+                          // 检查是否所有课程都已完成
+                          if (
+                            activeCourses.size === 0 &&
+                            selectedCourses.size === 0
+                          ) {
+                            alert(
+                              `抢课脚本已停止\n原因: 所有课程都无法选课成功\n建议: 检查网络连接或手动刷新页面后重试`,
+                            );
+                            stopGrabbing();
+                          }
                         }
                       }
                     }
@@ -1905,6 +2101,8 @@
       Notification.requestPermission();
     }
 
+    startDialogAutoConfirmWatchers();
+
     isRunning = true;
     attemptCount = 0;
     refreshInProgress = false;
@@ -1912,6 +2110,8 @@
       clearTimeout(refreshTimeoutId);
       refreshTimeoutId = null;
     }
+
+    startDialogAutoConfirmWatchers();
 
     // 初始化课程状态
     courseStates.clear();
@@ -2028,8 +2228,11 @@
       schedulerIntervalId = null;
     }
 
+    stopDialogAutoConfirmWatchers();
+
     scheduledTime = null;
     isScheduled = false;
+    scheduleModeEnabled = false;
 
     const startBtn = document.getElementById("cg-start-btn");
     const stopBtn = document.getElementById("cg-stop-btn");
@@ -2045,7 +2248,8 @@
         const timeValue = timeInput.value;
 
         if (!timeValue) {
-          alert("请先选择开抢时间！");
+          addUILog("warning", "请先选择开抢时间，再点击‘确定’；如果要立即抢课，请直接点击‘开始抢课’");
+          log("请先选择开抢时间，再点击‘确定’；如果要立即抢课，请直接点击‘开始抢课’", "warning");
           return;
         }
 
@@ -2053,12 +2257,14 @@
         const now = new Date();
 
         if (scheduleTime <= now) {
-          alert("开抢时间必须大于当前时间！");
+          addUILog("warning", "开抢时间必须大于当前时间");
+          log("开抢时间必须大于当前时间", "warning");
           return;
         }
 
         if (TARGET_COURSES.length === 0) {
-          alert("请先添加至少一门课程！");
+          addUILog("warning", "请先添加至少一门课程");
+          log("请先添加至少一门课程", "warning");
           return;
         }
 
@@ -2921,10 +3127,10 @@
                 <div class="cg-section">
                     <div class="cg-section-title">⏰ 定时开抢</div>
                     <div class="cg-time-input-group">
-                        <input type="datetime-local" class="cg-input" id="cg-schedule-time" placeholder="选择开抢时间">
-                        <button class="cg-btn cg-btn-secondary cg-btn-small" id="cg-schedule-btn">确定</button>
+                        <input type="datetime-local" class="cg-input" id="cg-schedule-time" placeholder="选择开抢时间" disabled>
+                        <button class="cg-btn cg-btn-secondary cg-btn-small" id="cg-schedule-toggle-btn">开启定时</button>
                     </div>
-                    <div class="cg-help-text">设置自动开抢时间，到时自动开始抢课</div>
+                    <div class="cg-help-text" id="cg-schedule-help">默认关闭定时模式；开启后才允许设置自动开抢时间</div>
                     <div id="cg-timer-display" style="display: none;"></div>
                 </div>
 
@@ -3018,6 +3224,34 @@
       btn.textContent = ui.classList.contains("cg-minimized") ? "□" : "−";
     };
 
+    const scheduleTimeInput = document.getElementById("cg-schedule-time");
+    const scheduleToggleBtn = document.getElementById("cg-schedule-toggle-btn");
+    const scheduleHelp = document.getElementById("cg-schedule-help");
+
+    const syncScheduleUI = () => {
+      if (!scheduleTimeInput || !scheduleToggleBtn) return;
+      scheduleTimeInput.disabled = !scheduleModeEnabled;
+      scheduleToggleBtn.textContent = scheduleModeEnabled ? "关闭定时" : "开启定时";
+      scheduleHelp.textContent = scheduleModeEnabled
+        ? "定时模式已开启：设置时间后，到点自动开始抢课"
+        : "默认关闭定时模式；开启后才允许设置自动开抢时间";
+    };
+
+    syncScheduleUI();
+
+    if (scheduleToggleBtn) {
+      scheduleToggleBtn.onclick = () => {
+        scheduleModeEnabled = !scheduleModeEnabled;
+        if (!scheduleModeEnabled) {
+          cancelScheduledStart();
+        } else {
+          addUILog("info", "已开启定时模式");
+          log("已开启定时模式", "info");
+        }
+        syncScheduleUI();
+      };
+    }
+
     // 添加课程
     document.getElementById("cg-add-course").onclick = () => {
       const code = document.getElementById("cg-course-code").value.trim();
@@ -3092,6 +3326,17 @@
         return;
       }
 
+      if (scheduleModeEnabled && scheduleTimeInput && scheduleTimeInput.value) {
+        const scheduleTime = new Date(scheduleTimeInput.value);
+        if (!isNaN(scheduleTime.getTime()) && scheduleTime > new Date()) {
+          setScheduledStart(scheduleTime);
+          document.getElementById("cg-start-btn").disabled = true;
+          document.getElementById("cg-stop-btn").disabled = false;
+          updateStatusDisplay();
+          return;
+        }
+      }
+
       window.grab.start();
       document.getElementById("cg-start-btn").disabled = true;
       document.getElementById("cg-stop-btn").disabled = false;
@@ -3116,31 +3361,7 @@
       window.grab.debug();
     };
 
-    // 定时开抢
-    document.getElementById("cg-schedule-btn").onclick = () => {
-      const timeInput = document.getElementById("cg-schedule-time");
-      const timeValue = timeInput.value;
-
-      if (!timeValue) {
-        alert("请先选择开抢时间！");
-        return;
-      }
-
-      const scheduleTime = new Date(timeValue);
-      const now = new Date();
-
-      if (scheduleTime <= now) {
-        alert("开抢时间必须大于当前时间！");
-        return;
-      }
-
-      if (TARGET_COURSES.length === 0) {
-        alert("请先添加至少一门课程！");
-        return;
-      }
-
-      setScheduledStart(scheduleTime);
-    };
+    // 定时模式按钮已改为开关按钮；不再直接绑定“确定”动作
 
     // 定期更新状态
     setInterval(updateStatusDisplay, 1000);
