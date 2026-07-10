@@ -22,7 +22,7 @@
     }
     if (__CG_GLOBAL__.grab && typeof __CG_GLOBAL__.grab.stop === "function") {
       try {
-        __CG_GLOBAL__.grab.stop();
+        __CG_GLOBAL__.grab.stop("reload");
       } catch (e) {}
     }
   }
@@ -76,11 +76,244 @@
   // ========== 配置 ==========
   const TARGET_COURSES = [];
 
-  const CHECK_INTERVAL = 150;
-  const MAX_ATTEMPTS = 3000;
+  const MAX_ATTEMPTS = 30000;
   const MAX_FAILED_ATTEMPTS = 10;
   const CONCURRENT_ENABLED = true;
+  const RESOLVE_RETRY_MS = 5000;
+  const QUERY_API_MIN_GAP_MS = 2500;
+  const MAX_RESOLVE_ATTEMPTS = 8;
+  const SESSION_VERIFY_INTERVAL_MS = 12000;
+  const SESSION_VERIFY_FAIL_STOP = 2;
+  const SESSION_HEALTHY_GRACE_MS = 60000;
 
+  // 喷射选课配置（可用 grab.config.setSpray / setSprayPreset 调整）
+  const SPRAY_PRESETS = {
+    safe: {
+      checkInterval: 60,
+      burstPerTick: 1,
+      maxInFlight: 3,
+      minGapMs: 200,
+      maxPerSecond: 5,
+      keepaliveMs: 0,
+      adaptive: true,
+    },
+    balanced: {
+      checkInterval: 30,
+      burstPerTick: 1,
+      maxInFlight: 4,
+      minGapMs: 125,
+      maxPerSecond: 8,
+      keepaliveMs: 0,
+      adaptive: true,
+    },
+    fast: {
+      checkInterval: 20,
+      burstPerTick: 1,
+      maxInFlight: 5,
+      minGapMs: 100,
+      maxPerSecond: 10,
+      keepaliveMs: 0,
+      adaptive: true,
+    },
+  };
+
+  let sprayConfig = { ...SPRAY_PRESETS.safe };
+  const sprayState = {
+    requestTimestamps: [],
+    lastStartAt: 0,
+    adaptiveMultiplier: 1,
+    badStreak: 0,
+    sessionVerifyFailStreak: 0,
+    lastSessionVerifyAt: 0,
+    hasSeenHealthySelect: false,
+    pausedUntil: 0,
+    keepaliveId: null,
+    lastHealthyAt: Date.now(),
+  };
+
+  function isSessionExpiredMessage(msg) {
+    return /会话|请先登录|登录页|登录系统|重新登录/i.test(msg || "");
+  }
+
+  function isSessionExpiredResult(result) {
+    if (!result) return false;
+    if (result.sessionExpired) return true;
+    return isSessionExpiredMessage(result.message);
+  }
+
+  function hasRecentHealthyResponse() {
+    return (
+      sprayState.hasSeenHealthySelect &&
+      Date.now() - sprayState.lastHealthyAt < SESSION_HEALTHY_GRACE_MS
+    );
+  }
+
+  function isAlreadySelectedMessage(msg) {
+    return /已选中|不可重复选择|刷新页面可见/i.test(msg || "");
+  }
+
+  function isSelectSuccessResult(result) {
+    if (!result) return false;
+    if (result.success === true || result.success === "true") return true;
+    const msg = result.message || "";
+    if (isAlreadySelectedMessage(msg)) return true;
+    return /成功|可以选择/.test(msg) && !/失败|已满|冲突/.test(msg);
+  }
+
+  async function checkSessionAlive() {
+    if (hasRecentHealthyResponse()) return true;
+    try {
+      const res = await fetch(getReferer(), {
+        method: "GET",
+        credentials: "include",
+        cache: "no-store",
+      });
+      const text = (await res.text()).slice(0, 800);
+      return !/请先登录|LoginToXk|用户登录/i.test(text);
+    } catch {
+      return true;
+    }
+  }
+
+  function getSprayLimits() {
+    const m = sprayConfig.adaptive ? sprayState.adaptiveMultiplier : 1;
+    return {
+      maxInFlight: sprayConfig.maxInFlight,
+      maxPerSecond: Math.max(2, Math.floor(sprayConfig.maxPerSecond / m)),
+      minGapMs: Math.floor(sprayConfig.minGapMs * m),
+    };
+  }
+
+  function canStartSelectRequest() {
+    const now = Date.now();
+    if (now < sprayState.pausedUntil) return false;
+
+    const limits = getSprayLimits();
+    sprayState.requestTimestamps = sprayState.requestTimestamps.filter(
+      (t) => now - t < 1000,
+    );
+    if (sprayState.requestTimestamps.length >= limits.maxPerSecond) {
+      return false;
+    }
+    if (now - sprayState.lastStartAt < limits.minGapMs) {
+      return false;
+    }
+    return true;
+  }
+
+  function recordSelectStart() {
+    const now = Date.now();
+    sprayState.requestTimestamps.push(now);
+    sprayState.lastStartAt = now;
+  }
+
+  function markSelectResponseHealthy(result) {
+    const msg = result?.message || "";
+    if (result?.success || /已满|人数已满/.test(msg)) {
+      sprayState.badStreak = 0;
+      sprayState.hasSeenHealthySelect = true;
+      sprayState.sessionVerifyFailStreak = 0;
+      sprayState.lastHealthyAt = Date.now();
+      if (sprayConfig.adaptive && sprayState.adaptiveMultiplier > 1) {
+        sprayState.adaptiveMultiplier = Math.max(
+          1,
+          sprayState.adaptiveMultiplier * 0.92,
+        );
+      }
+      return;
+    }
+
+    if (
+      result?.sessionExpired ||
+      isSessionExpiredMessage(msg)
+    ) {
+      return;
+    }
+
+    if (!msg || msg === "未知失败" || /空响应|HTML|格式异常/.test(msg)) {
+      sprayState.badStreak++;
+      if (sprayConfig.adaptive && sprayState.badStreak >= 3) {
+        sprayState.adaptiveMultiplier = Math.min(
+          4,
+          sprayState.adaptiveMultiplier * 1.4,
+        );
+        sprayState.pausedUntil = Date.now() + 2000;
+        sprayState.badStreak = 0;
+        const limits = getSprayLimits();
+        log(
+          `检测到异常响应，自动降速至约 ${limits.maxPerSecond} 次/秒，暂停 2 秒`,
+          "warning",
+        );
+      }
+    }
+  }
+
+  async function pingSessionKeepalive() {
+    if (!isRunning) return;
+    try {
+      const res = await fetch(getReferer(), {
+        method: "GET",
+        credentials: "include",
+        cache: "no-store",
+      });
+      const text = (await res.text()).slice(0, 800);
+      if (/请先登录|LoginToXk|用户登录/i.test(text)) {
+        log("保活检测：会话可能已失效，建议刷新页面重新登录", "warning");
+        sprayState.adaptiveMultiplier = Math.min(4, sprayState.adaptiveMultiplier * 2);
+        sprayState.pausedUntil = Date.now() + 5000;
+      }
+    } catch {
+      // 忽略保活失败
+    }
+  }
+
+  function startSessionKeepalive() {
+    stopSessionKeepalive();
+    if (!sprayConfig.keepaliveMs || sprayConfig.keepaliveMs <= 0) return;
+    sprayState.keepaliveId = setInterval(
+      pingSessionKeepalive,
+      sprayConfig.keepaliveMs,
+    );
+  }
+
+  function stopSessionKeepalive() {
+    if (sprayState.keepaliveId) {
+      clearInterval(sprayState.keepaliveId);
+      sprayState.keepaliveId = null;
+    }
+  }
+
+  function applySprayPreset(name) {
+    const preset = SPRAY_PRESETS[name];
+    if (!preset) {
+      log(`未知预设: ${name}，可选 safe / balanced / fast`, "error");
+      return false;
+    }
+    sprayConfig = { ...preset };
+    sprayState.adaptiveMultiplier = 1;
+    sprayState.badStreak = 0;
+    sprayState.sessionVerifyFailStreak = 0;
+    sprayState.lastSessionVerifyAt = 0;
+    sprayState.hasSeenHealthySelect = false;
+    sprayState.pausedUntil = 0;
+    log(`已切换喷射预设「${name}」`, "success");
+    return true;
+  }
+
+  function setSprayConfig(opts = {}) {
+    sprayConfig = { ...sprayConfig, ...opts };
+    sprayState.adaptiveMultiplier = 1;
+    sprayState.badStreak = 0;
+    sprayState.sessionVerifyFailStreak = 0;
+    sprayState.lastSessionVerifyAt = 0;
+    if (isRunning && intervalId) {
+      clearInterval(intervalId);
+      intervalId = setInterval(attemptGrabCourse, sprayConfig.checkInterval);
+      startSessionKeepalive();
+    }
+    log("喷射配置已更新", "info");
+    return { ...sprayConfig, ...getSprayLimits() };
+  }
   const GLOBAL_TIME_FILTER = [];
   const GLOBAL_TEACHER_FILTER = [];
 
@@ -101,8 +334,6 @@
   // ========== 东北电力 fetch 接口 ==========
   const API = {
     queryPath: "/jsxsd/xsxkkc/xsxkGgxxkxk",
-    queryString:
-      "kcxx=&skls=&skxq=&endJc=&skjc=&sfym=true&sfct=true&szjylb=&sfxx=true&skfs=",
     selectPath: "/jsxsd/xsxkkc/ggxxkxkOper",
     columns: [
       "kch",
@@ -133,21 +364,119 @@
     return location.href.split("#")[0];
   }
 
-  function buildQueryUrl() {
-    return `${location.origin}${API.queryPath}?${API.queryString}`;
+  function readPageQueryFilters() {
+    const getVal = (selectors) => {
+      for (const sel of selectors) {
+        const el = document.querySelector(sel);
+        if (el && "value" in el && el.value != null) {
+          return String(el.value).trim();
+        }
+      }
+      return "";
+    };
+
+    const getChecked = (selectors, defaultValue) => {
+      for (const sel of selectors) {
+        const el = document.querySelector(sel);
+        if (el && (el.type === "checkbox" || el.type === "radio")) {
+          return el.checked;
+        }
+      }
+      return defaultValue;
+    };
+
+    return {
+      kcxx: getVal(['input[name="kcxx"]', "#kcxx"]),
+      skls: getVal(['input[name="skls"]', "#skls"]),
+      skxq: getVal(['input[name="skxq"]', "#skxq"]),
+      endJc: getVal(['input[name="endJc"]', "#endJc"]),
+      skjc: getVal(['input[name="skjc"]', "#skjc"]),
+      szjylb: getVal(['select[name="szjylb"]', "#szjylb"]),
+      skfs: getVal(['select[name="skfs"]', "#skfs"]),
+      sfym: getChecked(['input[name="sfym"]', "#sfym"], false),
+      sfct: getChecked(['input[name="sfct"]', "#sfct"], true),
+      sfxx: getChecked(['input[name="sfxx"]', "#sfxx"], true),
+    };
+  }
+
+  function buildQueryParams(options = {}) {
+    const page = readPageQueryFilters();
+    const courseCode = String(options.courseCode || "").trim();
+    const { wideSearch = false, bulkWithPageFilters = false } = options;
+
+    if (bulkWithPageFilters) {
+      return {
+        kcxx: "",
+        skls: page.skls,
+        skxq: page.skxq,
+        endJc: page.endJc,
+        skjc: page.skjc,
+        sfym: page.sfym ? "true" : "false",
+        sfct: page.sfct ? "true" : "false",
+        szjylb: page.szjylb,
+        sfxx: page.sfxx ? "true" : "false",
+        skfs: page.skfs,
+      };
+    }
+
+    if (wideSearch && courseCode) {
+      return {
+        kcxx: courseCode,
+        skls: "",
+        skxq: "",
+        endJc: "",
+        skjc: "",
+        sfym: "false",
+        sfct: "false",
+        szjylb: "",
+        sfxx: "false",
+        skfs: "",
+      };
+    }
+
+    const targeting = Boolean(courseCode);
+    return {
+      kcxx: targeting ? courseCode : page.kcxx,
+      skls: page.skls,
+      skxq: page.skxq,
+      endJc: page.endJc,
+      skjc: page.skjc,
+      // 定向查询仅关闭「已满」过滤，其余继承页面筛选条件
+      sfym: targeting ? "false" : page.sfym ? "true" : "false",
+      sfct: page.sfct ? "true" : "false",
+      szjylb: page.szjylb,
+      sfxx: page.sfxx ? "true" : "false",
+      skfs: page.skfs,
+    };
+  }
+
+  function buildQueryUrl(options = {}) {
+    const qs = new URLSearchParams(buildQueryParams(options));
+    return `${location.origin}${API.queryPath}?${qs}`;
   }
 
   function parseHtmlErrorHint(html) {
-    if (!html || html.charAt(0) !== "<") return null;
-    if (/登录|login|session|timeout|超时|重新登录/i.test(html)) {
+    if (!html) return null;
+    const text = String(html).trim();
+    if (!text) return "服务器返回空响应";
+    if (text.charAt(0) !== "<") return null;
+
+    if (/请先登录|LoginToXk|userAccount|btn-login|用户登录/i.test(text)) {
+      return "会话已失效（服务器返回登录页），请刷新页面重新登录后再运行脚本";
+    }
+    if (/登录|login|session|timeout|超时|重新登录/i.test(text)) {
       return "会话可能已过期，请刷新页面重新登录后再运行脚本";
     }
-    const alertMatch = html.match(/alert\s*\(\s*['"]([^'"]+)['"]\s*\)/i);
+    const showMsg = text.match(/id=["']showMsg["'][^>]*>([^<]+)/i);
+    if (showMsg) {
+      return `服务器返回: ${showMsg[1].trim()}`;
+    }
+    const alertMatch = text.match(/alert\s*\(\s*['"]([^'"]+)['"]\s*\)/i);
     if (alertMatch) {
       return `服务器返回: ${alertMatch[1]}`;
     }
-    if (/<!DOCTYPE|<html/i.test(html)) {
-      return "服务器返回了 HTML 页面而非 JSON，请确认在公选课页面且已登录";
+    if (/<!DOCTYPE|<html/i.test(text)) {
+      return "服务器返回了 HTML 页面而非 JSON，请确认已登录且在公选课页面";
     }
     return null;
   }
@@ -167,23 +496,29 @@
     }
   }
 
-  function buildQueryBody() {
+  function buildQueryBody(options = {}) {
+    const params = buildQueryParams(options);
+    const courseCode = String(options.courseCode || "").trim();
+    const targeting = Boolean(courseCode) && !options.bulkWithPageFilters;
     const p = new URLSearchParams();
-    p.append("kcxx", "");
-    p.append("skls", "");
-    p.append("skxq", "");
-    p.append("endJc", "");
-    p.append("skjc", "");
-    p.append("sfym", "true");
-    p.append("sfct", "true");
-    p.append("szjylb", "");
-    p.append("sfxx", "true");
-    p.append("skfs", "");
+    p.append("kcxx", params.kcxx);
+    p.append("skls", params.skls);
+    p.append("skxq", params.skxq);
+    p.append("endJc", params.endJc);
+    p.append("skjc", params.skjc);
+    p.append("sfym", params.sfym);
+    p.append("sfct", params.sfct);
+    p.append("szjylb", params.szjylb);
+    p.append("sfxx", params.sfxx);
+    p.append("skfs", params.skfs);
     p.append("sEcho", "1");
     p.append("iColumns", "12");
     p.append("sColumns", "");
     p.append("iDisplayStart", "0");
-    p.append("iDisplayLength", "100");
+    p.append(
+      "iDisplayLength",
+      options.bulkWithPageFilters ? "500" : targeting ? "50" : "200",
+    );
     API.columns.forEach((col, i) => p.append(`mDataProp_${i}`, col));
     return p;
   }
@@ -209,47 +544,71 @@
     });
   }
 
-  let courseListCache = { data: null, at: 0 };
-  let courseListQueryPromise = null;
-  const COURSE_LIST_CACHE_MS = 300;
+  const courseListCache = new Map();
+  const courseListQueryPromises = new Map();
+  const COURSE_LIST_CACHE_MS = 3000;
+  let lastQueryApiAt = 0;
+
+  function getCourseListCacheKey(options = {}) {
+    const code = String(options.courseCode || "").trim();
+    return code || "__bulk__";
+  }
+
+  function normalizeQueryData(data) {
+    if (!data || typeof data !== "object") {
+      return { aaData: [], iRecordsTotal: 0, iTotalDisplayRecords: 0 };
+    }
+    if (!Array.isArray(data.aaData)) {
+      data.aaData = [];
+    }
+    return data;
+  }
 
   async function queryCourseList(options = {}) {
-    const { force = false } = options;
+    const { force = false, courseCode = "" } = options;
+    const cacheKey = getCourseListCacheKey(options);
     const now = Date.now();
+    const cached = courseListCache.get(cacheKey);
     if (
       !force &&
-      courseListCache.data &&
-      now - courseListCache.at < COURSE_LIST_CACHE_MS
+      cached &&
+      now - cached.at < COURSE_LIST_CACHE_MS
     ) {
-      return courseListCache.data;
+      return cached.data;
     }
 
-    if (courseListQueryPromise) {
-      return courseListQueryPromise;
+    if (courseListQueryPromises.has(cacheKey)) {
+      return courseListQueryPromises.get(cacheKey);
     }
 
-    courseListQueryPromise = (async () => {
+    const queryPromise = (async () => {
+      const gapWait = QUERY_API_MIN_GAP_MS - (Date.now() - lastQueryApiAt);
+      if (gapWait > 0) {
+        await new Promise((r) => setTimeout(r, gapWait));
+      }
+      lastQueryApiAt = Date.now();
+
       let lastError = null;
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
-          const url = buildQueryUrl();
+          const url = buildQueryUrl(options);
           const res = await apiFetch(url, {
             method: "POST",
-            body: buildQueryBody(),
+            body: buildQueryBody(options),
           });
           if (!res.ok) {
             throw new Error(`HTTP ${res.status} ${res.statusText}`);
           }
-          const data = parseQueryResponse(await res.text());
-          const rowCount = (data.aaData || []).length;
+          const data = normalizeQueryData(parseQueryResponse(await res.text()));
+          const rowCount = data.aaData.length;
           if (
             rowCount === 0 &&
-            courseListCache.data &&
-            (courseListCache.data.aaData || []).length > 0
+            cached &&
+            (cached.data.aaData || []).length > 0
           ) {
             throw new Error("查询返回空列表，疑似会话异常");
           }
-          courseListCache = { data, at: Date.now() };
+          courseListCache.set(cacheKey, { data, at: Date.now() });
           return data;
         } catch (error) {
           lastError = error;
@@ -259,17 +618,19 @@
         }
       }
 
-      if (courseListCache.data) {
+      if (cached) {
         log(`查询失败(${lastError?.message})，使用上一轮缓存`, "warning");
-        return courseListCache.data;
+        return cached.data;
       }
       throw lastError || new Error("查询课程列表失败");
     })();
 
+    courseListQueryPromises.set(cacheKey, queryPromise);
+
     try {
-      return await courseListQueryPromise;
+      return await queryPromise;
     } finally {
-      courseListQueryPromise = null;
+      courseListQueryPromises.delete(cacheKey);
     }
   }
 
@@ -279,36 +640,76 @@
     return filtered.map((row) => courseRowToTeachingClass(row, courseCode));
   }
 
-  function extractCourseIds(row) {
-    const czOper = typeof row === "object" && !Array.isArray(row) ? row.czOper || "" : "";
-    let kcid =
-      row.kcid || row.kch_id || row.kchId || row.pkid || row.jx0404kcid || null;
-    let jx0404id =
-      row.jx0404id || row.skbjids || row.jxb_id || row.jx0404_id || null;
+  function decodeHtmlEntities(str) {
+    if (!str || typeof str !== "string") return "";
+    return str
+      .replace(/&quot;/gi, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">");
+  }
 
-    const linkMatch = czOper.match(
-      /ggxxkxkOper\?kcid=([^&"']+)[^"']*jx0404id=([^&"']+)/i,
-    );
-    const onclickMatch = czOper.match(
-      /ggxxkxkOper\s*\(\s*'([^']+)'\s*,\s*'[^']*'\s*,\s*'([^']+)'/i,
-    );
-    const ids = linkMatch || onclickMatch;
-    if (ids) {
-      kcid = ids[1];
-      jx0404id = ids[2];
+  function extractIdsFromOperString(operStr) {
+    if (!operStr) return { kcid: null, jx0404id: null };
+    const text = decodeHtmlEntities(String(operStr));
+
+    const patterns = [
+      /ggxxkxkOper\?kcid=([^&"']+)[^"']*jx0404id=([^&"'\s<>]+)/i,
+      /ggxxkxkOper\s*\(\s*["']([^"']+)["']\s*,\s*["'][^"']*["']\s*,\s*["']([^"']+)["']/i,
+      /kcid=([0-9A-F]{32})[^"']*jx0404id=([0-9]+)/i,
+      /jx0404id=([0-9]+)[^"']*kcid=([0-9A-F]{32})/i,
+    ];
+
+    for (let i = 0; i < patterns.length; i++) {
+      const match = text.match(patterns[i]);
+      if (!match) continue;
+      if (i === 3) {
+        return { kcid: match[2], jx0404id: match[1] };
+      }
+      return { kcid: match[1], jx0404id: match[2] };
     }
 
-    if (!kcid && row && typeof row === "object") {
+    return { kcid: null, jx0404id: null };
+  }
+
+  function extractCourseIds(row) {
+    const normalized =
+      typeof row === "object" && !Array.isArray(row)
+        ? row
+        : normalizeCourseRow(row);
+    const czOper = normalized.czOper || "";
+    let { kcid, jx0404id } = extractIdsFromOperString(czOper);
+
+    if (!kcid) {
+      kcid =
+        normalized.kcid ||
+        normalized.kch_id ||
+        normalized.kchId ||
+        normalized.pkid ||
+        normalized.jx0404kcid ||
+        null;
+    }
+    if (!jx0404id) {
+      jx0404id =
+        normalized.jx0404id ||
+        normalized.skbjids ||
+        normalized.jxb_id ||
+        normalized.jx0404_id ||
+        null;
+    }
+
+    if (!kcid && normalized && typeof normalized === "object") {
       const preferKeys = ["pkid", "kcid", "kch_id", "jx0404kcid", "rwid"];
       for (const key of preferKeys) {
-        const val = row[key];
+        const val = normalized[key];
         if (typeof val === "string" && /^[0-9A-F]{32}$/i.test(val)) {
           kcid = val;
           break;
         }
       }
       if (!kcid) {
-        for (const val of Object.values(row)) {
+        for (const val of Object.values(normalized)) {
           if (
             typeof val === "string" &&
             /^[0-9A-F]{32}$/i.test(val) &&
@@ -319,6 +720,10 @@
           }
         }
       }
+    }
+
+    if (!jx0404id && typeof normalized.jx0404id === "string") {
+      jx0404id = normalized.jx0404id;
     }
 
     return { kcid, jx0404id };
@@ -397,15 +802,34 @@
 
   function parseSelectResult(data) {
     if (typeof data === "string") {
+      const trimmed = data.trim();
       try {
-        data = JSON.parse(data);
+        data = JSON.parse(trimmed);
       } catch {
-        return { success: /成功/i.test(data), message: data.slice(0, 120) };
+        return {
+          success: /成功/.test(trimmed) && !/失败|已满|冲突/.test(trimmed),
+          message: trimmed.slice(0, 200),
+        };
       }
     }
+    if (!data || typeof data !== "object") {
+      return { success: false, message: "响应格式异常" };
+    }
+    const message = String(
+      data.message || data.msg || data.msgContent || data.error || "",
+    ).trim();
+    const sessionExpired = isSessionExpiredMessage(message);
+    const alreadySelected = isAlreadySelectedMessage(message);
+    const success =
+      data.success === true ||
+      data.success === "true" ||
+      alreadySelected ||
+      (/成功|可以选择/.test(message) && !/失败|已满|冲突/.test(message));
     return {
-      success: data.success === true,
-      message: data.message || data.msg || "",
+      success,
+      message: message || (sessionExpired ? "请先登录系统" : ""),
+      sessionExpired,
+      alreadySelected,
       raw: data,
     };
   }
@@ -423,13 +847,24 @@
     if (!res.ok) {
       throw new Error(`选课 HTTP ${res.status}`);
     }
-    const text = await res.text();
-    if (text.trim().charAt(0) === "<") {
+    const text = (await res.text()).trim();
+    if (!text) {
+      return { success: false, message: "选课返回空响应" };
+    }
+    if (text.charAt(0) === "<") {
       const hint = parseHtmlErrorHint(text);
-      return { success: false, message: hint || "选课返回 HTML 而非 JSON" };
+      return {
+        success: false,
+        message: hint || "选课返回 HTML 而非 JSON",
+        sessionExpired: /会话|登录/.test(hint || ""),
+      };
     }
     try {
-      return parseSelectResult(JSON.parse(text));
+      const parsed = parseSelectResult(JSON.parse(text));
+      if (!parsed.message && parsed.raw) {
+        parsed.message = JSON.stringify(parsed.raw).slice(0, 120);
+      }
+      return parsed;
     } catch {
       return parseSelectResult(text);
     }
@@ -472,6 +907,14 @@
       conflicted: new Set(),
       selecting: false,
       success: false,
+      resolvedTargets: null,
+      selectAttempts: 0,
+      resolveAttempts: 0,
+      resolving: false,
+      lastResolveAt: 0,
+      selectInFlight: 0,
+      resolvePaused: false,
+      lastFailMessage: "",
     });
   }
 
@@ -514,199 +957,367 @@
     return syrs > 0;
   }
 
+  function getCourseConfig(courseCode) {
+    return TARGET_COURSES.find((c) => c.code === courseCode) || null;
+  }
+
+  function buildManualTarget(courseConfig) {
+    const code = courseConfig.code;
+    return {
+      courseCode: code,
+      info: {
+        id: courseConfig.jx0404id,
+        className: courseConfig.name || code,
+        teacher: courseConfig.teacher || "",
+        capacity: "",
+        timeInfo: "",
+        kcid: courseConfig.kcid,
+        jx0404id: courseConfig.jx0404id,
+        syrs: 0,
+        kch: code,
+      },
+    };
+  }
+
+  function resolveManualTargets(courseCode) {
+    const config = getCourseConfig(courseCode);
+    if (config?.kcid && config?.jx0404id) {
+      return [buildManualTarget(config)];
+    }
+    return null;
+  }
+
+  function parseCourseTargetsFromDom(courseCode) {
+    const code = String(courseCode).trim();
+    const rows = document.querySelectorAll("table tbody tr");
+    for (const tr of rows) {
+      const text = tr.textContent || "";
+      if (!text.includes(code)) continue;
+
+      const operEl =
+        tr.querySelector('a[onclick*="Oper"]') ||
+        tr.querySelector('a[href*="Oper"]') ||
+        tr.querySelector("td:last-child a");
+      if (!operEl) continue;
+
+      const operBlob =
+        (operEl.getAttribute("onclick") || "") +
+        (operEl.getAttribute("href") || "") +
+        operEl.outerHTML;
+      const { kcid, jx0404id } = extractIdsFromOperString(operBlob);
+      if (!kcid || !jx0404id) continue;
+
+      return [
+        {
+          courseCode: code,
+          info: {
+            id: jx0404id,
+            className: text.replace(/\s+/g, " ").trim().slice(0, 60),
+            teacher: "",
+            capacity: "",
+            timeInfo: "",
+            kcid,
+            jx0404id,
+            syrs: 0,
+            kch: code,
+          },
+        },
+      ];
+    }
+    return [];
+  }
+
+  function pickValidTeachingClasses(classes) {
+    return classes.filter((tc) => tc?.info?.kcid && tc?.info?.jx0404id);
+  }
+
   async function findAllTeachingClasses(courseCode) {
-    const raw = await queryCourseList();
+    const manual = resolveManualTargets(courseCode);
+    if (manual) {
+      log(`使用手动配置的 kcid/jx0404id`, "info", courseCode);
+      return manual;
+    }
+
+    const raw = await queryCourseList({
+      courseCode,
+      wideSearch: true,
+      force: true,
+    });
+    const total = raw.iRecordsTotal ?? raw.iTotalDisplayRecords ?? "?";
     const rows = parseCourseRows(raw);
-    return findTeachingClassesInRows(rows, courseCode);
-  }
+    const matched = findTeachingClassesInRows(rows, courseCode);
+    let valid = pickValidTeachingClasses(matched);
 
-  async function selectTeachingClass(teachingClass) {
-    if (!teachingClass?.info?.kcid || !teachingClass?.info?.jx0404id) {
-      return false;
+    if (!valid.length && rows.length === 1 && rows[0].kcid && rows[0].jx0404id) {
+      valid = [courseRowToTeachingClass(rows[0], courseCode)];
     }
 
-    const courseCode = teachingClass.courseCode;
-    const classId = teachingClass.info.id;
-    const state = getCourseState(courseCode);
-
-    if (state.conflicted.has(classId) || state.tried.has(classId)) {
-      return false;
-    }
-
-    state.selecting = true;
-    state.tried.add(classId);
-
-    try {
-      log(
-        `选课: ${teachingClass.info.className} (${teachingClass.info.teacher})`,
-        "info",
-        courseCode,
-      );
-      log(`时间: ${teachingClass.info.timeInfo}`, "info", courseCode);
-      log(`容量: ${teachingClass.info.capacity}`, "info", courseCode);
-      if (teachingClass.info.xf) {
-        log(`学分: ${teachingClass.info.xf}`, "info", courseCode);
-      }
-      log(
-        `参数: kcid=${teachingClass.info.kcid}, jx0404id=${teachingClass.info.jx0404id}`,
-        "info",
-        courseCode,
-      );
-
-      const result = await selectCourseApi(
-        teachingClass.info.kcid,
-        teachingClass.info.jx0404id,
-      );
-
-      if (result.success) {
-        state.failed = 0;
-        state.success = true;
-        selectedCourses.add(courseCode);
-        activeCourses.delete(courseCode);
-        log(`🎊 选课成功: ${result.message}`, "success", courseCode);
-
-        if (window.Notification && Notification.permission === "granted") {
-          new Notification("抢课成功", {
-            body: `${courseCode} ${teachingClass.info.className}`,
-          });
+    if (!valid.length) {
+      for (const row of rows) {
+        if (row.kcid && row.jx0404id) {
+          valid.push(courseRowToTeachingClass(row, courseCode));
         }
-        courseListCache = { data: null, at: 0 };
-        await new Promise((r) => setTimeout(r, 500));
-        return true;
       }
-
-      if (/冲突/.test(result.message)) {
-        state.conflicted.add(classId);
-      }
-      state.failed++;
-      log(`选课失败: ${result.message}`, "error", courseCode);
-      if (result.raw) {
-        console.log("[选课原始响应]", result.raw);
-      }
-      courseListCache = { data: null, at: 0 };
-      await new Promise((r) => setTimeout(r, 500));
-      return false;
-    } catch (error) {
-      state.failed++;
-      log(`选课异常: ${error.message}`, "error", courseCode);
-      return false;
-    } finally {
-      state.selecting = false;
     }
+
+    if (valid.length) {
+      log(
+        `接口 kcxx=${courseCode} 返回 ${rows.length} 条（总计 ${total}）`,
+        "info",
+        courseCode,
+      );
+      return valid;
+    }
+
+    const domTargets = parseCourseTargetsFromDom(courseCode);
+    if (domTargets.length) {
+      log(`备用：从页面 DOM 解析到 ${courseCode}`, "info", courseCode);
+      return domTargets;
+    }
+
+    return [];
   }
 
-  async function attemptGrabSingleCourse(courseCode, allRows, totalRows = 0) {
+  async function ensureCourseResolved(courseCode) {
     const state = getCourseState(courseCode);
+    if (state.resolvedTargets?.length) return true;
+    if (state.resolvePaused) return false;
 
-    if (state.selecting || state.success || state.failed >= MAX_FAILED_ATTEMPTS) {
-      return;
+    const now = Date.now();
+    if (now - state.lastResolveAt < RESOLVE_RETRY_MS) {
+      return false;
     }
-    if (grabbingInProgress.has(courseCode)) return;
+    state.lastResolveAt = now;
 
-    grabbingInProgress.add(courseCode);
-    state.attempts++;
+    state.resolveAttempts++;
+    const classes = await findAllTeachingClasses(courseCode);
+    const valid = pickValidTeachingClasses(classes);
 
-    try {
-      const teachingClasses = findTeachingClassesInRows(allRows, courseCode);
-      if (teachingClasses.length === 0) {
-        if (state.attempts === 1 || state.attempts % 20 === 0) {
+    if (valid.length === 0) {
+      if (state.resolveAttempts === 1 || state.resolveAttempts % 5 === 0) {
+        if (classes.length > 0) {
           log(
-            `列表中未找到 ${courseCode}（当前 ${totalRows} 条，请确认课程号在当前选课列表）`,
+            `找到 ${courseCode} 但 czOper 中缺少 kcid/jx0404id，请点「调试」查看原始数据`,
+            "warning",
+            courseCode,
+          );
+        } else {
+          log(
+            `接口未返回 ${courseCode} 的 kcid/jx0404id（${RESOLVE_RETRY_MS / 1000}s 后重试）。` +
+              `或手动传入 grab.start([{code:"${courseCode}", kcid:"...", jx0404id:"..."}])`,
             "warning",
             courseCode,
           );
         }
-        return;
       }
-
-      let hasNonConflictedFullClass = false;
-
-      for (const tc of teachingClasses) {
-        if (!tc?.info?.id) continue;
-        const classId = tc.info.id;
-        if (state.conflicted.has(classId) || state.tried.has(classId)) continue;
-
-        const filterResult = matchesFilters(tc, courseCode);
-        if (!filterResult.match) continue;
-
-        if (!checkTeachingClassCapacity(tc)) {
-          hasNonConflictedFullClass = true;
-          continue;
-        }
-
+      if (state.resolveAttempts >= MAX_RESOLVE_ATTEMPTS) {
+        state.resolvePaused = true;
         log(
-          `🎯 发现有余量: ${tc.info.className} (剩余 ${tc.info.syrs ?? "?"})`,
-          "success",
+          `已暂停查询接口（避免影响页面刷新），请手动传入 kcid/jx0404id 后重新 start`,
+          "error",
           courseCode,
         );
-
-        await selectTeachingClass(tc);
-        return;
       }
-
-      if (
-        !hasNonConflictedFullClass &&
-        state.conflicted.size > 0 &&
-        state.conflicted.size === teachingClasses.length
-      ) {
-        log("🛑 所有教学班均冲突，停止该课程", "error", courseCode);
-        activeCourses.delete(courseCode);
-      }
-
-      if (state.attempts % 10 === 0 && state.tried.size > 0) {
-        state.tried.clear();
-      }
-    } catch (error) {
-      state.failed++;
-      log(`处理异常: ${error.message}`, "error", courseCode);
-    } finally {
-      grabbingInProgress.delete(courseCode);
+      return false;
     }
+
+    state.resolvedTargets = valid;
+    for (const tc of valid) {
+      log(
+        `已锁定选课参数: ${tc.info.className || courseCode} | kcid=${tc.info.kcid} | jx0404id=${tc.info.jx0404id}`,
+        "success",
+        courseCode,
+      );
+    }
+    return true;
+  }
+
+  function fireSelectBurst(courseCode) {
+    const state = getCourseState(courseCode);
+    if (state.success || !state.resolvedTargets?.length) return;
+
+    const limits = getSprayLimits();
+    for (let burst = 0; burst < sprayConfig.burstPerTick; burst++) {
+      if (state.success || state.selectInFlight >= limits.maxInFlight) break;
+      for (const target of state.resolvedTargets) {
+        if (state.success || state.selectInFlight >= limits.maxInFlight) break;
+        if (!canStartSelectRequest()) break;
+        recordSelectStart();
+        void spraySelectOnce(courseCode, target);
+      }
+    }
+  }
+
+  async function spraySelectOnce(courseCode, target) {
+    const state = getCourseState(courseCode);
+    if (state.success) return true;
+    const limits = getSprayLimits();
+    if (state.selectInFlight >= limits.maxInFlight) return false;
+
+    const { kcid, jx0404id, className } = target.info;
+    state.selectInFlight++;
+    state.selectAttempts++;
+
+    try {
+      const result = await selectCourseApi(kcid, jx0404id);
+
+      if (isSelectSuccessResult(result)) {
+        state.success = true;
+        selectedCourses.add(courseCode);
+        activeCourses.delete(courseCode);
+        const successMsg =
+          result.alreadySelected || isAlreadySelectedMessage(result.message)
+            ? `已选上该课（${result.message || className || courseCode}）`
+            : result.message || className || courseCode;
+        log(`🎊 选课成功: ${successMsg}`, "success", courseCode);
+        if (window.Notification && Notification.permission === "granted") {
+          new Notification("抢课成功", {
+            body: `${courseCode} ${className || ""}`.trim(),
+          });
+        }
+        return true;
+      }
+
+      const failMsg = result.message || "未知失败";
+      state.lastFailMessage = failMsg;
+      markSelectResponseHealthy(result);
+
+      if (isSessionExpiredResult(result)) {
+        sprayState.adaptiveMultiplier = Math.min(
+          4,
+          sprayState.adaptiveMultiplier * 1.5,
+        );
+        sprayState.pausedUntil = Math.max(
+          sprayState.pausedUntil,
+          Date.now() + 2000,
+        );
+
+        // 近期有「已满」等正常响应 → 会话一定有效，不因选课接口偶发登录提示而停止
+        if (hasRecentHealthyResponse()) {
+          if (state.selectAttempts <= 5 || state.selectAttempts % 100 === 0) {
+            log(
+              `⚠️ 偶发限流（${failMsg}），近期仍有「已满」响应，继续蹲课`,
+              "warning",
+              courseCode,
+            );
+          }
+          return false;
+        }
+
+        const now = Date.now();
+        if (now - sprayState.lastSessionVerifyAt >= SESSION_VERIFY_INTERVAL_MS) {
+          sprayState.lastSessionVerifyAt = now;
+          const sessionAlive = await checkSessionAlive();
+          if (!sessionAlive) {
+            sprayState.sessionVerifyFailStreak++;
+            if (sprayState.sessionVerifyFailStreak >= SESSION_VERIFY_FAIL_STOP) {
+              log(`⚠️ 页面会话已失效，停止抢课`, "error", courseCode);
+              stopGrabbing("session_expired");
+              alert(
+                "选课会话已失效！\n请刷新页面重新登录后，再运行脚本。\n\n建议先用 grab.config.setSprayPreset('safe') 降低请求频率。",
+              );
+              return false;
+            }
+            log(
+              `⚠️ 页面会话验证失败（${sprayState.sessionVerifyFailStreak}/${SESSION_VERIFY_FAIL_STOP}），降速继续观察`,
+              "warning",
+              courseCode,
+            );
+          } else {
+            sprayState.sessionVerifyFailStreak = 0;
+            if (state.selectAttempts <= 5 || state.selectAttempts % 100 === 0) {
+              log(
+                `⚠️ 选课接口偶发「${failMsg}」，页面会话仍有效，已降速继续`,
+                "warning",
+                courseCode,
+              );
+            }
+          }
+        }
+        return false;
+      }
+      sprayState.sessionVerifyFailStreak = 0;
+
+      if (/冲突/.test(failMsg)) {
+        log(`选课失败（时间冲突）: ${failMsg}`, "error", courseCode);
+        activeCourses.delete(courseCode);
+        return false;
+      }
+
+      if (state.selectAttempts === 1) {
+        log(`持续选课开始: ${failMsg}`, "info", courseCode);
+      } else if (state.selectAttempts % 50 === 0) {
+        const limits = getSprayLimits();
+        log(
+          `持续选课 #${state.selectAttempts}: ${failMsg}（并发 ${state.selectInFlight}，约 ${limits.maxPerSecond}/s）`,
+          "info",
+          courseCode,
+        );
+      }
+      return false;
+    } catch (error) {
+      state.lastFailMessage = error.message;
+      if (state.selectAttempts === 1 || state.selectAttempts % 100 === 0) {
+        log(`选课请求异常: ${error.message}`, "error", courseCode);
+      }
+      return false;
+    } finally {
+      state.selectInFlight = Math.max(0, state.selectInFlight - 1);
+    }
+  }
+
+  async function attemptGrabSingleCourse(courseCode) {
+    const state = getCourseState(courseCode);
+    if (state.success) return;
+
+    if (!state.resolvedTargets?.length) {
+      if (state.resolving) return;
+      state.resolving = true;
+      try {
+        await ensureCourseResolved(courseCode);
+      } finally {
+        state.resolving = false;
+      }
+      if (!state.resolvedTargets?.length) return;
+    }
+
+    state.attempts++;
+    fireSelectBurst(courseCode);
   }
 
   let grabCycleInProgress = false;
 
   async function runGrabCycle() {
-    if (grabCycleInProgress || !isRunning) return;
-    grabCycleInProgress = true;
+    if (!isRunning) return;
 
-    try {
-      attemptCount++;
+    attemptCount++;
 
-      if (attemptCount > MAX_ATTEMPTS) {
-        log(`已达到最大尝试次数 ${MAX_ATTEMPTS}，停止抢课`, "warning");
-        stopGrabbing();
-        return;
-      }
+    if (attemptCount > MAX_ATTEMPTS) {
+      log(`已达到最大尝试次数 ${MAX_ATTEMPTS}，停止抢课`, "warning");
+      stopGrabbing("max_attempts");
+      return;
+    }
 
-      if (activeCourses.size === 0) {
-        log("所有课程已完成", "success");
-        stopGrabbing();
-        return;
-      }
+    if (activeCourses.size === 0) {
+      log("所有课程已完成", "success");
+      stopGrabbing("all_done");
+      return;
+    }
 
-      const raw = await queryCourseList();
-      const allRows = parseCourseRows(raw);
+    const sortedCourses = Array.from(activeCourses).sort((a, b) => {
+      const courseA = TARGET_COURSES.find((c) => c.code === a);
+      const courseB = TARGET_COURSES.find((c) => c.code === b);
+      return (courseA?.priority ?? 999) - (courseB?.priority ?? 999);
+    });
 
-      if (attemptCount === 1 || attemptCount % 10 === 0) {
-        log(
-          `第 ${attemptCount} 次轮询，列表 ${allRows.length} 条，监控 ${activeCourses.size} 门课`,
-        );
-      }
+    if (attemptCount === 1 || attemptCount % 50 === 0) {
+      log(
+        `第 ${attemptCount} 轮持续选课，监控 ${sortedCourses.length} 门课`,
+      );
+    }
 
-      const sortedCourses = Array.from(activeCourses).sort((a, b) => {
-        const courseA = TARGET_COURSES.find((c) => c.code === a);
-        const courseB = TARGET_COURSES.find((c) => c.code === b);
-        return (courseA?.priority ?? 999) - (courseB?.priority ?? 999);
-      });
-
-      for (const courseCode of sortedCourses) {
-        await attemptGrabSingleCourse(courseCode, allRows, allRows.length);
-      }
-    } catch (error) {
-      log(`本轮查询失败: ${error.message}`, "error");
-    } finally {
-      grabCycleInProgress = false;
+    for (const courseCode of sortedCourses) {
+      void attemptGrabSingleCourse(courseCode);
     }
   }
 
@@ -742,25 +1353,59 @@
     courseStates.clear();
     selectedCourses.clear();
     activeCourses.clear();
+    sprayState.sessionVerifyFailStreak = 0;
+    sprayState.lastSessionVerifyAt = 0;
+    sprayState.hasSeenHealthySelect = false;
+    sprayState.adaptiveMultiplier = 1;
+    sprayState.pausedUntil = 0;
 
     for (const course of coursesToGrab) {
       const courseCode = typeof course === "string" ? course : course.code;
       activeCourses.add(courseCode);
       initCourseState(courseCode);
+
+      if (typeof course === "object" && course.kcid && course.jx0404id) {
+        const target = buildManualTarget({ code: courseCode, ...course });
+        getCourseState(courseCode).resolvedTargets = [target];
+        log(
+          `已锁定选课参数: kcid=${course.kcid} | jx0404id=${course.jx0404id}`,
+          "success",
+          courseCode,
+        );
+      } else {
+        const manual = resolveManualTargets(courseCode);
+        if (manual) {
+          getCourseState(courseCode).resolvedTargets = manual;
+          log(
+            `已锁定选课参数: kcid=${manual[0].info.kcid} | jx0404id=${manual[0].info.jx0404id}`,
+            "success",
+            courseCode,
+          );
+        }
+      }
     }
 
-    log(`🚀 开始监控 ${activeCourses.size} 门课程 (fetch 接口)`, "success");
+    log(`🚀 开始喷射选课 ${activeCourses.size} 门课程 (ggxxkxkOper)`, "success");
     log(`📋 课程: ${Array.from(activeCourses).join(", ")}`, "info");
-    log(`⏱️ 间隔: ${CHECK_INTERVAL}ms`, "info");
+    const limits = getSprayLimits();
+    log(
+      `⏱️ ${limits.maxPerSecond}次/秒 + ${limits.maxInFlight}并发（safe 预设）| 自适应降速已开启`,
+      "info",
+    );
+    log(
+      "💡 蹲课需在退课前启动并保持运行；锁定参数后会持续打选课接口（「已满」= 正常蹲课中）",
+      "info",
+    );
 
-    queryCourseList({ force: true })
-      .then((data) => {
-        log(`预加载课程列表 ${parseCourseRows(data).length} 条`, "info");
-      })
-      .catch((e) => log(`预加载失败: ${e.message}`, "warning"));
+    for (const courseCode of activeCourses) {
+      ensureCourseResolved(courseCode).catch((e) =>
+        log(`解析选课参数失败: ${e.message}`, "warning", courseCode),
+      );
+    }
 
     attemptGrabCourse();
-    intervalId = setInterval(attemptGrabCourse, CHECK_INTERVAL);
+    intervalId = setInterval(attemptGrabCourse, sprayConfig.checkInterval);
+    startSessionKeepalive();
   }
 
   function disposeGrabbingRuntime() {
@@ -774,10 +1419,11 @@
       clearInterval(schedulerIntervalId);
       schedulerIntervalId = null;
     }
+    stopSessionKeepalive();
 
     grabbingInProgress.clear();
-    courseListCache = { data: null, at: 0 };
-    courseListQueryPromise = null;
+    courseListCache.clear();
+    courseListQueryPromises.clear();
     grabCycleInProgress = false;
     scheduledTime = null;
     isScheduled = false;
@@ -792,13 +1438,23 @@
     if (timerDisplay) timerDisplay.style.display = "none";
   }
 
-  function stopGrabbing() {
+  function stopGrabbing(reason = "manual") {
     if (!isRunning && !isScheduled && !intervalId && !schedulerIntervalId) {
       log("抢课脚本未运行", "info");
       return;
     }
     disposeGrabbingRuntime();
-    log("⏹️ 抢课脚本已停止", "warning");
+    const reasonText = {
+      manual: "手动停止",
+      session_expired: "会话失效",
+      max_attempts: "达到最大轮次",
+      all_done: "全部完成",
+      reload: "脚本重新加载",
+    }[reason] || reason;
+    log(
+      `⏹️ 抢课脚本已停止（${reasonText}）。若页面无法刷新，请等待几秒后重试或重新打开选课页`,
+      "warning",
+    );
   }
 
   function getStatus() {
@@ -807,7 +1463,9 @@
       attemptCount,
       activeCourses: Array.from(activeCourses),
       selectedCourses: Array.from(selectedCourses),
-      checkInterval: CHECK_INTERVAL,
+      checkInterval: sprayConfig.checkInterval,
+      sprayLimits: getSprayLimits(),
+      adaptiveMultiplier: sprayState.adaptiveMultiplier,
       maxAttempts: MAX_ATTEMPTS,
       concurrentMode: CONCURRENT_ENABLED,
       mode: "fetch",
@@ -898,7 +1556,15 @@
         TARGET_COURSES.length = 0;
         TARGET_COURSES.push(...courses);
       },
-      getInterval: () => CHECK_INTERVAL,
+      getInterval: () => sprayConfig.checkInterval,
+      getSpray: () => ({
+        ...sprayConfig,
+        ...getSprayLimits(),
+        adaptiveMultiplier: sprayState.adaptiveMultiplier,
+      }),
+      setSpray: setSprayConfig,
+      setSprayPreset: applySprayPreset,
+      getSprayPresets: () => Object.keys(SPRAY_PRESETS),
       getConcurrentMode: () => CONCURRENT_ENABLED,
       getGlobalTimeFilter: () => GLOBAL_TIME_FILTER,
       getGlobalTeacherFilter: () => GLOBAL_TEACHER_FILTER,
@@ -916,6 +1582,8 @@
   console.log("  grab.start()  开始抢课");
   console.log("  grab.stop()   停止");
   console.log('  grab.debug("课程号")  查看接口数据');
+  console.log("  grab.config.setSprayPreset('safe'|'balanced'|'fast')  防踢下线预设");
+  console.log("  grab.config.setSpray({ maxPerSecond: 10, maxInFlight: 6 })  自定义限速");
   if (!isSupportedPage()) {
     console.warn("⚠️ 当前页面不是 /jsxsd/ 选课页，请进入公选课页面后再 start");
   }
